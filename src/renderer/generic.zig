@@ -1489,26 +1489,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Direct pixel scroll - just use the offset from Surface
-            // Convert pixels to lines and apply -1.0 offset for extra top row
+            // Pixel scroll offset calculation
+            // We render rows+2 (1 extra at top, 1 extra at bottom)
+            // The offset shifts content so that at rest, the extra top row is hidden
+            // During scroll animation, we show partial content from extra rows
 
-            // Spring animation for scroll jumps
-            var spring_offset_px: f32 = 0;
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+            // Base offset: cell_height puts us at "normal" position (extra top row hidden)
+            // scroll_pixel_offset (0 to cell_height) is the sub-cell offset from mouse/trackpad
+            var base_offset = cell_h - self.scroll_pixel_offset;
+
+            // Spring animation for scroll jumps (keyboard scrolling, Neovim hints, etc.)
             if (self.scroll_animating) {
                 const scroll_len = self.config.scroll_animation_duration;
                 const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
                 self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
 
-                // Clamp spring position to max 1 line (we only have 1 extra row at each edge)
-                // This prevents black bars at edges during large scroll animations
-                // Larger scrolls will animate smoothly but cap at 1 line of visual offset
-                const max_spring_lines: f32 = 1.0;
-                const clamped_position = @max(-max_spring_lines, @min(self.scroll_spring.position, max_spring_lines));
-                spring_offset_px = clamped_position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                // Use only the FRACTIONAL part of spring position for visual offset
+                // This way large scrolls still animate smoothly but visual effect
+                // stays within our ±1 extra row bounds
+                // fract(x) = x - floor(x), gives us 0.0 to 1.0 range
+                const spring_pos = self.scroll_spring.position;
+                const fractional = spring_pos - @floor(spring_pos);
+
+                // If spring is negative, fractional will be positive (0 to 1)
+                // but we want negative offset, so check sign
+                const visual_offset = if (spring_pos >= 0)
+                    fractional * cell_h
+                else
+                    (fractional - 1.0) * cell_h; // -1 to 0 range for negative
+
+                base_offset += visual_offset;
             }
 
-            const cell_h_scroll: f32 = @floatFromInt(self.grid_metrics.cell_height);
-            self.uniforms.pixel_scroll_offset_y = (cell_h_scroll - self.scroll_pixel_offset) + spring_offset_px;
+            // Final offset should be in range [0, 2*cell_h] for our extra rows
+            self.uniforms.pixel_scroll_offset_y = @max(0.0, @min(base_offset, 2.0 * cell_h));
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
