@@ -163,6 +163,10 @@ pub const Command = union(Key) {
         scroll_top: u32,
         /// Bottom row of scroll region (exclusive, 0 = use grid height)
         scroll_bot: u32,
+        /// Left column of scroll region (0-indexed, cols left of this are fixed)
+        scroll_left: u32 = 0,
+        /// Right column of scroll region (exclusive, 0 = use grid width)
+        scroll_right: u32 = 0,
     },
 
     pub const SemanticPrompt = parsers.semantic_prompt.Command;

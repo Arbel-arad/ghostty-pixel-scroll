@@ -223,6 +223,10 @@ pub const Uniforms = extern struct {
     /// Starts at the full delta and animates toward 0.
     tui_scroll_offset_y: f32 align(4) = 0,
 
+    /// Horizontal scroll region for split windows (NvimTree etc.)
+    scroll_region_left: u32 align(4) = 0,
+    scroll_region_right: u32 align(4) = 0,
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,
@@ -270,7 +274,8 @@ pub const CellText = extern struct {
     bools: packed struct(u8) {
         no_min_contrast: bool = false,
         is_cursor_glyph: bool = false,
-        _padding: u6 = 0,
+        is_scroll_glyph: bool = false,
+        _padding: u5 = 0,
     } align(1) = .{},
 
     pub const Atlas = enum(u8) {

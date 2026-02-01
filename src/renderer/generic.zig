@@ -239,6 +239,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Rows outside this region (status bar, cmdline) should not scroll.
         tui_scroll_top: u32 = 0,
         tui_scroll_bot: u32 = 0,
+        tui_scroll_left: u32 = 0,
+        tui_scroll_right: u32 = 0,
+        tui_scroll_active: bool = false,
 
         /// This value is used to force-update swap chain targets in the
         /// event of a config change that requires it (such as blending mode).
@@ -1363,6 +1366,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 tui_scroll_delta: i32,
                 tui_scroll_top: u32,
                 tui_scroll_bot: u32,
+                tui_scroll_left: u32,
+                tui_scroll_right: u32,
+                tui_scroll_active: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1460,6 +1466,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const tui_delta = state.terminal.tui_scroll_delta;
                 const tui_top = state.terminal.tui_scroll_top;
                 const tui_bot = state.terminal.tui_scroll_bot;
+                const tui_left = state.terminal.tui_scroll_left;
+                const tui_right = state.terminal.tui_scroll_right;
+                const tui_active = state.terminal.tui_scroll_active;
                 if (tui_delta != 0) {
                     @as(*Terminal, @constCast(state.terminal)).tui_scroll_delta = 0;
                 }
@@ -1473,6 +1482,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .tui_scroll_delta = tui_delta,
                     .tui_scroll_top = tui_top,
                     .tui_scroll_bot = tui_bot,
+                    .tui_scroll_left = tui_left,
+                    .tui_scroll_right = tui_right,
+                    .tui_scroll_active = tui_active,
                 };
             };
 
@@ -1605,12 +1617,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.tui_scroll_delta = critical.tui_scroll_delta;
                     self.tui_scroll_top = critical.tui_scroll_top;
                     self.tui_scroll_bot = critical.tui_scroll_bot;
+                    self.tui_scroll_left = critical.tui_scroll_left;
+                    self.tui_scroll_right = critical.tui_scroll_right;
+                }
+                if (critical.tui_scroll_active) {
+                    self.tui_scroll_active = true;
+                }
+                if (critical.tui_scroll_active) {
+                    self.tui_scroll_active = true;
                 }
 
                 // Update scroll region uniforms for shaders
                 // This tells the GPU which rows should scroll vs stay fixed
                 self.uniforms.scroll_region_top = self.tui_scroll_top;
                 self.uniforms.scroll_region_bot = self.tui_scroll_bot;
+                self.uniforms.scroll_region_left = self.tui_scroll_left;
+                self.uniforms.scroll_region_right = self.tui_scroll_right;
 
                 // Update our background color
                 self.uniforms.bg_color = .{
@@ -1716,8 +1738,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
             // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning
-            // This keeps an extra row hidden above viewport for smooth scrolling
-            const base_offset = cell_h - self.scroll_pixel_offset;
+            // This keeps an extra row hidden above viewport for smooth scrolling.
+            // For TUI smooth scrolling, we don't want the hidden-row offset.
+            const base_offset: f32 = if (self.tui_scroll_active) 0 else cell_h - self.scroll_pixel_offset;
             self.uniforms.pixel_scroll_offset_y = base_offset;
 
             // TUI scroll animation (Neovide-style per-cell offset)
@@ -1827,12 +1850,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.tui_scroll_delta != 0) {
                 if (self.tui_scrollback) |*scrollback| {
                     // Queue the scroll event - will be processed in flush()
-                    scrollback.queueScroll(self.tui_scroll_delta, self.tui_scroll_top, self.tui_scroll_bot);
+                    scrollback.queueScroll(self.tui_scroll_delta, self.tui_scroll_top, self.tui_scroll_bot, self.tui_scroll_left, self.tui_scroll_right);
 
-                    log.warn("TUI Scroll queued: delta={} top={} bot={}", .{
+                    log.warn("TUI Scroll queued: delta={} top={} bot={} left={} right={}", .{
                         self.tui_scroll_delta,
                         self.tui_scroll_top,
                         self.tui_scroll_bot,
+                        self.tui_scroll_left,
+                        self.tui_scroll_right,
                     });
 
                     self.scroll_animating = true;
@@ -1919,13 +1944,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     //    animation in the vertex shader.
                     try scrollback.populateCellsForRender(&self.cells);
 
+                    // TUI scrollback handles the extra row itself, so don't apply
+                    // terminal scrollback's hidden-row offset while animating.
+                    self.uniforms.pixel_scroll_offset_y = 0;
+
                     // Sub-pixel offset for smooth animation
                     self.uniforms.tui_scroll_offset_y = scrollback.getSubLineOffset(cell_height_f);
 
-                    log.warn("TUI Scrollback animating: position={d:.2} lines, line_offset={}, sub_pixel={d:.1}px", .{
+                    log.warn("TUI Scroll: pos={d:.2} offset_y={d:.1}px pixel_scroll={d:.1}px padding_top={d:.1}px", .{
                         scrollback.scroll_animation.position,
-                        scrollback.getScrollOffsetLines(),
                         self.uniforms.tui_scroll_offset_y,
+                        self.uniforms.pixel_scroll_offset_y,
+                        self.uniforms.grid_padding[0], // top padding
                     });
                 } else {
                     self.uniforms.tui_scroll_offset_y = 0;

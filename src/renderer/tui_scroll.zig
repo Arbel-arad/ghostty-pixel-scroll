@@ -201,8 +201,12 @@ pub const TuiScrollback = struct {
     grid_columns: usize = 0,
 
     /// Scroll region from OSC 9999 (in grid row indices).
+    /// top = first scrollable row (rows before are fixed header like tabline)
+    /// bot = first non-scrollable row at bottom (like statusline)
     scroll_region_top: usize = 0,
     scroll_region_bot: usize = 0,
+    scroll_region_left: usize = 0,
+    scroll_region_right: usize = 0,
 
     /// Scroll animation using critically damped spring.
     /// Position is in LINES. Negative = showing old content (scrolling up).
@@ -275,17 +279,19 @@ pub const TuiScrollback = struct {
     }
 
     /// Set scroll region from OSC 9999.
-    pub fn setScrollRegion(self: *Self, top: u32, bot: u32) void {
+    pub fn setScrollRegion(self: *Self, top: u32, bot: u32, left: u32, right: u32) void {
         self.scroll_region_top = @intCast(top);
         // bot=0 means "until end of grid"
         self.scroll_region_bot = if (bot == 0) self.grid_rows else @intCast(bot);
+        self.scroll_region_left = @intCast(left);
+        self.scroll_region_right = if (right == 0) self.grid_columns else @intCast(right);
     }
 
     /// Queue a scroll event. Will be processed on next flush().
-    pub fn queueScroll(self: *Self, delta: i32, top: u32, bot: u32) void {
+    pub fn queueScroll(self: *Self, delta: i32, top: u32, bot: u32, left: u32, right: u32) void {
         self.pending_scroll_delta += delta;
-        self.setScrollRegion(top, bot);
-        log.debug("TuiScrollback queueScroll: delta={} top={} bot={} pending={}", .{ delta, top, bot, self.pending_scroll_delta });
+        self.setScrollRegion(top, bot, left, right);
+        log.debug("TuiScrollback queueScroll: delta={} top={} bot={} left={} right={} pending={}", .{ delta, top, bot, left, right, self.pending_scroll_delta });
     }
 
     /// Get the number of scrollable rows (excluding margins/fixed rows).
@@ -393,6 +399,18 @@ pub const TuiScrollback = struct {
     /// Neovide formula: (floor(position) - position) * cell_height
     pub fn getSubLineOffset(self: *const Self, cell_height: f32) f32 {
         const floor_pos = @floor(self.scroll_animation.position);
+
+        // Always use (floor - pos) which gives the negative fractional part.
+        // This is correct because we render the NEW content (at destination)
+        // and shift it "backwards" to the start position.
+        // - Scroll DOWN (pos < 0): Content moves UP. We render at New, shift DOWN?
+        //   Wait. If pos=-0.9. floor=-1. diff=-0.1. Shift UP.
+        //   Render at Row 0. Shift UP to -0.1. Moves -0.1 -> 0. (Down).
+        //   Wait. Scroll DOWN -> Content moves UP.
+        //   Old Row 1 moves to Row 0.
+        //   New Row 0 moves to Row -1.
+
+        // Let's stick to Neovide's formula which is proven.
         return (floor_pos - self.scroll_animation.position) * cell_height;
     }
 
@@ -429,47 +447,145 @@ pub const TuiScrollback = struct {
         const scroll_offset_lines = self.getScrollOffsetLines();
         const inner_size = self.getScrollableRowCount();
 
-        log.warn("populateCellsForRender: offset={} inner_size={}", .{ scroll_offset_lines, inner_size });
+        const scroll_left = self.scroll_region_left;
+        const scroll_right = self.scroll_region_right;
+        const full_width = scroll_left == 0 and scroll_right == self.grid_columns;
 
-        // For each screen row, read from scrollback with offset
-        for (0..inner_size) |i| {
-            // Buffer index = offset + screen_row
-            // When offset is -1 and i=0: we read scrollback[-1] (old content)
-            // When offset is -1 and i=1: we read scrollback[0] (new row 0)
-            // etc.
-            const buffer_index = scroll_offset_lines + @as(isize, @intCast(i));
-            const scrollback_row = self.getRow(buffer_index);
+        // Calculate extended range to cover content sliding in from edges
+        const start_i: isize = @min(0, -scroll_offset_lines);
+        const end_i: isize = @max(@as(isize, @intCast(inner_size)), @as(isize, @intCast(inner_size)) - scroll_offset_lines);
 
-            // Write to screen row i (within scroll region)
-            const grid_row = self.scroll_region_top + i;
+        // Iterate over the extended range
+        for (0..@intCast(end_i - start_i)) |k| {
+            const i = start_i + @as(isize, @intCast(k));
 
-            if (scrollback_row == null) {
-                if (i < 3) log.warn("  screen_row {}: buffer[{}] -> NULL", .{ i, buffer_index });
-                continue;
-            }
+            // Buffer index = offset + screen_row (relative to top of scroll region)
+            const buffer_index = scroll_offset_lines + i;
+            const scrollback_row = self.getRow(buffer_index) orelse continue;
 
-            const row = scrollback_row.?;
-            if (i < 3) {
-                log.warn("  screen_row {}: buffer[{}] -> fg_cells={}", .{ i, buffer_index, row.fg_cells.items.len });
-            }
+            // Determine target logical grid row (visual position)
+            const grid_row_signed = @as(isize, @intCast(self.scroll_region_top)) + i;
 
-            // Copy background cells
-            const bg_start = grid_row * cells.size.columns;
-            const bg_end = bg_start + cells.size.columns;
-            if (bg_end <= cells.bg_cells.len and row.columns == cells.size.columns) {
-                @memcpy(cells.bg_cells[bg_start..bg_end], row.bg_cells);
-            }
+            // Is this an "extra" row (outside the normal scroll region)?
+            // i.e., sliding in from header or footer area
+            const is_extra = i < 0 or i >= inner_size;
 
-            // Copy foreground cells, adjusting grid_pos to match screen position
-            const fg_row_index = grid_row + 1;
-            if (fg_row_index < cells.fg_rows.lists.len) {
-                const dest_list = &cells.fg_rows.lists[fg_row_index];
-                dest_list.clearRetainingCapacity();
+            if (!is_extra) {
+                // Determine actual row index in cells buffer
+                if (grid_row_signed < 0 or grid_row_signed >= self.grid_rows) continue;
+                const grid_row: usize = @intCast(grid_row_signed);
 
-                for (row.fg_cells.items) |cell_text| {
-                    var adjusted = cell_text;
-                    adjusted.grid_pos[1] = @intCast(grid_row);
-                    try dest_list.append(self.alloc, adjusted);
+                // For inner rows, overwrite scroll region only for partial-width scrolls
+                const bg_start = grid_row * cells.size.columns;
+                const bg_end = bg_start + cells.size.columns;
+                if (bg_end <= cells.bg_cells.len and scrollback_row.columns == cells.size.columns) {
+                    if (full_width) {
+                        @memcpy(cells.bg_cells[bg_start..bg_end], scrollback_row.bg_cells);
+                    } else if (scroll_left < scroll_right and scroll_right <= cells.size.columns) {
+                        const row_start = bg_start + scroll_left;
+                        const row_end = bg_start + scroll_right;
+                        @memcpy(cells.bg_cells[row_start..row_end], scrollback_row.bg_cells[scroll_left..scroll_right]);
+                    }
+                }
+
+                // Foreground
+                const fg_row_index = grid_row + 1;
+                if (fg_row_index < cells.fg_rows.lists.len) {
+                    const dest_list = &cells.fg_rows.lists[fg_row_index];
+                    dest_list.clearRetainingCapacity();
+
+                    if (full_width) {
+                        for (scrollback_row.fg_cells.items) |cell_text| {
+                            var adjusted = cell_text;
+                            adjusted.grid_pos[1] = @intCast(grid_row);
+                            try dest_list.append(self.alloc, adjusted);
+                        }
+                    } else {
+                        const current_row = self.getRow(@intCast(i));
+                        if (current_row) |row_ptr| {
+                            for (row_ptr.fg_cells.items) |cell_text| {
+                                if (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right) {
+                                    var adjusted = cell_text;
+                                    adjusted.grid_pos[1] = @intCast(grid_row);
+                                    try dest_list.append(self.alloc, adjusted);
+                                }
+                            }
+                        }
+                        for (scrollback_row.fg_cells.items) |cell_text| {
+                            if (cell_text.grid_pos[0] >= scroll_left and cell_text.grid_pos[0] < scroll_right) {
+                                var adjusted = cell_text;
+                                adjusted.grid_pos[1] = @intCast(grid_row);
+                                try dest_list.append(self.alloc, adjusted);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // For EXTRA rows (ghost rows), we inject them into the nearest valid scrollable row list.
+                // We do NOT touch the background or clear the list, so header/footer stays intact.
+                // We rely on IS_SCROLL_GLYPH + vertex shader to shift them, and fragment shader to clip.
+
+                // Clamp destination row to be inside scroll region
+                // This ensures restoreCells() will clean them up later
+                var dest_row_idx = grid_row_signed;
+                if (dest_row_idx < @as(isize, @intCast(self.scroll_region_top))) {
+                    dest_row_idx = @as(isize, @intCast(self.scroll_region_top));
+                } else if (dest_row_idx >= @as(isize, @intCast(self.scroll_region_bot))) {
+                    if (self.scroll_region_bot > 0) {
+                        dest_row_idx = @as(isize, @intCast(self.scroll_region_bot)) - 1;
+                    } else {
+                        dest_row_idx = @as(isize, @intCast(self.grid_rows)) - 1;
+                    }
+                }
+
+                if (dest_row_idx < 0 or dest_row_idx >= self.grid_rows) continue;
+                const fg_row_index = @as(usize, @intCast(dest_row_idx)) + 1;
+
+                if (fg_row_index < cells.fg_rows.lists.len) {
+                    const dest_list = &cells.fg_rows.lists[fg_row_index];
+                    // Append to existing content
+
+                    for (scrollback_row.fg_cells.items) |cell_text| {
+                        if (!full_width and (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right)) {
+                            continue;
+                        }
+                        var adjusted = cell_text;
+                        // Use REAL logical position (e.g. inside header) so shift calculation is correct relative to start
+                        // But wait, if grid_pos is outside region, in_scroll check fails unless we set flag.
+                        // We assume grid_row_signed is correct logic position.
+                        // However, grid_pos is u16. If grid_row_signed is negative, we can't represent it!
+
+                        // If row -1, we can't set grid_pos.y = -1.
+                        // Vertex shader uses grid_pos to compute cell_pos.
+                        // If we can't represent -1, we can't place it correctly.
+
+                        // Trick: Set grid_pos to NEAREST valid, and rely on shader offset?
+                        // No, shader offset is uniform `tui_scroll_offset_y`.
+
+                        // We need to render at `header - shift`.
+                        // If we can't express `header - 1`, we have a problem.
+
+                        // Wait, if scrolling UP (content moves DOWN).
+                        // Ghost row is at `header`. Shifted DOWN into view.
+                        // `grid_row` = header (0). Valid u16!
+                        // Shift = +offset.
+                        // Result: 0 + offset. Visible.
+
+                        // If scrolling DOWN (content moves UP).
+                        // Ghost row is at `footer`. Shifted UP into view.
+                        // `grid_row` = footer. Valid u16!
+                        // Shift = -offset.
+                        // Result: footer - offset. Visible.
+
+                        // So grid_row IS always valid u16, because it's the SOURCE position.
+                        // The "ghost" comes from the header row or footer row.
+
+                        if (grid_row_signed >= 0 and grid_row_signed < 65535) {
+                            adjusted.grid_pos[1] = @intCast(grid_row_signed);
+                            adjusted.bools.is_scroll_glyph = true;
+                            try dest_list.append(self.alloc, adjusted);
+                        }
+                    }
                 }
             }
         }

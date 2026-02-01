@@ -395,12 +395,16 @@ pub const Action = union(Key) {
         grid: i32,
         scroll_top: u32,
         scroll_bot: u32,
+        scroll_left: u32,
+        scroll_right: u32,
 
         pub const C = extern struct {
             scroll_delta: i32,
             grid: i32,
             scroll_top: u32,
             scroll_bot: u32,
+            scroll_left: u32,
+            scroll_right: u32,
         };
 
         pub fn cval(self: NvimScrollHint) NvimScrollHint.C {
@@ -409,6 +413,8 @@ pub const Action = union(Key) {
                 .grid = self.grid,
                 .scroll_top = self.scroll_top,
                 .scroll_bot = self.scroll_bot,
+                .scroll_left = self.scroll_left,
+                .scroll_right = self.scroll_right,
             };
         }
     };
@@ -2068,6 +2074,8 @@ pub fn Stream(comptime Handler: type) type {
                         .grid = v.grid,
                         .scroll_top = v.scroll_top,
                         .scroll_bot = v.scroll_bot,
+                        .scroll_left = v.scroll_left,
+                        .scroll_right = v.scroll_right,
                     });
                 },
 

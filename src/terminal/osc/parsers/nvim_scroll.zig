@@ -32,6 +32,8 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
     var grid: ?i32 = null;
     var scroll_top: ?u32 = null;
     var scroll_bot: ?u32 = null;
+    var scroll_left: ?u32 = null;
+    var scroll_right: ?u32 = null;
 
     // Split by ';' and parse each key=value pair
     var iter = mem.splitScalar(u8, data[0 .. data.len - 1], ';');
@@ -48,6 +50,12 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
         } else if (mem.startsWith(u8, part, "bot=")) {
             const value_str = part["bot=".len..];
             scroll_bot = std.fmt.parseInt(u32, value_str, 10) catch null;
+        } else if (mem.startsWith(u8, part, "left=")) {
+            const value_str = part["left=".len..];
+            scroll_left = std.fmt.parseInt(u32, value_str, 10) catch null;
+        } else if (mem.startsWith(u8, part, "right=")) {
+            const value_str = part["right=".len..];
+            scroll_right = std.fmt.parseInt(u32, value_str, 10) catch null;
         }
     }
 
@@ -63,6 +71,8 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
             .grid = grid orelse 1,
             .scroll_top = scroll_top orelse 0,
             .scroll_bot = scroll_bot orelse 0, // 0 means "use grid height"
+            .scroll_left = scroll_left orelse 0,
+            .scroll_right = scroll_right orelse 0, // 0 means "use grid width"
         },
     };
     return &parser.command;

@@ -28,6 +28,7 @@ const uint ATLAS_COLOR = 1u;
 // Masks for the `glyph_bools` attribute
 const uint NO_MIN_CONTRAST = 1u;
 const uint IS_CURSOR_GLYPH = 2u;
+const uint IS_SCROLL_GLYPH = 4u;
 
 out CellTextVertexOut {
     flat uint atlas;
@@ -35,6 +36,7 @@ out CellTextVertexOut {
     flat vec4 bg_color;
     vec2 tex_coord;
     vec2 screen_pos;  // For clipping during scroll
+    flat uint is_in_scroll_region; // Only clip cells that are part of the scroll region
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -47,8 +49,16 @@ void main() {
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     
-    // Determine effective scroll region (bot = 0 means use grid height)
+    // Determine effective scroll region (bot/right = 0 means use grid size)
     uint effective_scroll_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
+    uint effective_scroll_right = scroll_region_right == 0u ? grid_size.x : scroll_region_right;
+
+    // Check if this cell is in the scroll region
+    // Include manual override from IS_SCROLL_GLYPH (for cells sliding in from header/footer)
+    bool in_scroll = (grid_pos.y >= scroll_region_top && grid_pos.y < effective_scroll_bot &&
+                      grid_pos.x >= scroll_region_left && grid_pos.x < effective_scroll_right) ||
+                     ((glyph_bools & IS_SCROLL_GLYPH) != 0u);
+    out_data.is_in_scroll_region = in_scroll ? 1u : 0u;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
@@ -58,46 +68,14 @@ void main() {
     // We use a triangle strip with 4 vertices to render quads,
     // so we determine which corner of the cell this vertex is in
     // based on the vertex ID.
-    //
-    //   0 --> 1
-    //   |   .'|
-    //   |  /  |
-    //   | L   |
-    //   2 --> 3
-    //
-    // 0 = top-left  (0, 0)
-    // 1 = top-right (1, 0)
-    // 2 = bot-left  (0, 1)
-    // 3 = bot-right (1, 1)
-    vec2 corner;
-    corner.x = float(vid == 1 || vid == 3);
-    corner.y = float(vid == 2 || vid == 3);
+    vec2 corner = vec2(vid & 1, vid >> 1);
 
-    out_data.atlas = atlas;
-
-    //              === Grid Cell ===
-    //      +X
-    // 0,0--...->
-    //   |
-    //   . offset.x = bearings.x
-    // +Y.               .|.
-    //   .               | |
-    //   |   cell_pos -> +-------+   _.
-    //   v             ._|       |_. _|- offset.y = cell_size.y - bearings.y
-    //                 | | .###. | |
-    //                 | | #...# | |
-    //   glyph_size.y -+ | ##### | |
-    //                 | | #.... | +- bearings.y
-    //                 |_| .#### | |
-    //                   |       |_|
-    //                   +-------+
-    //                     |_._|
-    //                       |
-    //                  glyph_size.x
+    // Calculate the position of the cell in the texture atlas
+    // accounting for the corner we are currently processing.
     //
-    // In order to get the top left of the glyph, we compute an offset based on
-    // the bearings. The Y bearing is the distance from the bottom of the cell
-    // to the top of the glyph, so we subtract it from the cell height to get
+    // The Y bearing is the distance from the baseline to the top of the glyph,
+    // so we subtract it from the cell height to get the y offset.
+    // However, our coordinate system is top-left, so we need to flip
     // the y offset. The X bearing is the distance from the left of the cell
     // to the left of the glyph, so it works as the x offset directly.
 
@@ -125,9 +103,10 @@ void main() {
     // - It animates toward 0 using a spring
     // - Cells within the scroll region are shifted by this offset, creating the sliding effect
     // - At animation end (offset = 0), cells are in their final positions
-    if (tui_scroll_offset_y != 0.0 && grid_pos.y >= scroll_region_top && grid_pos.y < effective_scroll_bot) {
+    if (tui_scroll_offset_y != 0.0 && in_scroll) {
         cell_pos.y += tui_scroll_offset_y;
     }
+
     
     // Apply cursor animation offset if this is the cursor glyph
     if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {

@@ -29,6 +29,8 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint scroll_region_top;  // First scrollable row (rows above are fixed)
     uniform uint scroll_region_bot;  // Last scrollable row+1 (rows at/below are fixed), 0 = grid height
     uniform float tui_scroll_offset_y;  // TUI scroll animation offset in pixels (Neovide-style)
+    uniform uint scroll_region_left;
+    uniform uint scroll_region_right;
 };
 
 // Bools
