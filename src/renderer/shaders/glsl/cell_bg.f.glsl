@@ -12,11 +12,36 @@ layout(binding = 1, std430) readonly buffer bg_cells {
 
 vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-    // Apply pixel scroll offset for smooth scrolling
+    bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
+    
+    // Determine effective scroll region (bot = 0 means use grid height)
+    uint effective_scroll_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
+    
+    // Calculate grid position from fragment coordinates
+    // We apply pixel_scroll_offset_y here to match the vertex shader shift
+    // This is for base grid alignment (terminal scrollback), NOT TUI scroll animation
     vec2 adjusted_coord = gl_FragCoord.xy;
     adjusted_coord.y += pixel_scroll_offset_y;
+    
+    // For TUI scroll animation: determine if this fragment is in the scroll region
+    // and apply the inverse offset to find which cell's background to draw.
+    // The text cells are shifted by tui_scroll_offset_y, so we need to shift the
+    // background sampling in the opposite direction to match.
     ivec2 grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
-    bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
+    
+    // Check if this grid position is in the scroll region BEFORE applying TUI offset
+    bool in_scroll_region = grid_pos.y >= int(scroll_region_top) && grid_pos.y < int(effective_scroll_bot);
+    
+    // Apply TUI scroll offset to the coordinate for sampling
+    // Since text is shifted by +offset (vertex shader), we need to shift the background sampling
+    // to match.
+    // If offset is negative (text moves UP), we want to see the background that was originally
+    // BELOW this pixel. So we need to add a positive amount to the Y coord.
+    // coordinate - offset = coordinate - (-amount) = coordinate + amount (DOWN)
+    if (tui_scroll_offset_y != 0.0 && in_scroll_region) {
+        adjusted_coord.y -= tui_scroll_offset_y;
+        grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+    }
 
     vec4 bg = vec4(0.0);
 
@@ -36,17 +61,14 @@ vec4 cell_bg() {
     }
 
     // Clamp y position if we should extend, otherwise discard if out of bounds.
-    // When pixel_scroll_offset_y is non-zero (smooth scrolling active), always clamp
-    // to ensure we fill edges with content from extra rows instead of black.
-    bool scrolling = pixel_scroll_offset_y != cell_size.y;
     if (grid_pos.y < 0) {
-        if (scrolling || (padding_extend & EXTEND_UP) != 0) {
+        if ((padding_extend & EXTEND_UP) != 0) {
             grid_pos.y = 0;
         } else {
             return bg;
         }
     } else if (grid_pos.y > grid_size.y - 1) {
-        if (scrolling || (padding_extend & EXTEND_DOWN) != 0) {
+        if ((padding_extend & EXTEND_DOWN) != 0) {
             grid_pos.y = int(grid_size.y) - 1;
         } else {
             return bg;

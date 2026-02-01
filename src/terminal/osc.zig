@@ -159,6 +159,10 @@ pub const Command = union(Key) {
         scroll_delta: i32,
         /// The Neovim grid ID (usually 1 for main window)
         grid: i32,
+        /// Top row of scroll region (0-indexed, rows above this are fixed)
+        scroll_top: u32,
+        /// Bottom row of scroll region (exclusive, 0 = use grid height)
+        scroll_bot: u32,
     },
 
     pub const SemanticPrompt = parsers.semantic_prompt.Command;

@@ -23,9 +23,12 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
-    uniform float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels
+    uniform float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels (terminal scrollback)
     uniform float cursor_offset_x;  // Cursor animation X offset in pixels
     uniform float cursor_offset_y;  // Cursor animation Y offset in pixels
+    uniform uint scroll_region_top;  // First scrollable row (rows above are fixed)
+    uniform uint scroll_region_bot;  // Last scrollable row+1 (rows at/below are fixed), 0 = grid height
+    uniform float tui_scroll_offset_y;  // TUI scroll animation offset in pixels (Neovide-style)
 };
 
 // Bools
@@ -33,6 +36,7 @@ const uint CURSOR_WIDE = 1u;
 const uint USE_DISPLAY_P3 = 2u;
 const uint USE_LINEAR_BLENDING = 4u;
 const uint USE_LINEAR_CORRECTION = 8u;
+const uint EXCLUDE_CURSOR = 16u;
 
 // Padding extend enum
 const uint EXTEND_LEFT = 1u;

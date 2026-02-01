@@ -410,22 +410,10 @@ pub const RenderState = struct {
 
         // TUI scroll delta from Neovim OSC 9999
         //
-        // NOTE: We intentionally do NOT use this for scroll animation currently.
-        // The problem is TUI apps redraw the entire screen instantly - there's no
-        // "old content" that smoothly scrolls into "new content". Our current
-        // pixel offset approach just shifts everything including edges, which
-        // looks bad (edges bounce).
-        //
-        // Proper smooth scroll for TUIs would need:
-        // 1. Capture previous frame to texture
-        // 2. Render new frame to another texture
-        // 3. Crossfade/blend between them during animation
-        //
-        // For now, just consume and discard the hint.
-        if (t.tui_scroll_delta != 0) {
-            // Don't add to scroll_jump - just consume the hint
-            @as(*Terminal, @constCast(t)).tui_scroll_delta = 0;
-        }
+        // NOTE: The tui_scroll_delta is now consumed by the renderer (generic.zig)
+        // for frame-capture scroll animation. Don't consume it here!
+        // The renderer reads it after calling terminal_state.update() and
+        // clears it after reading.
 
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };

@@ -19,21 +19,30 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
+    // Manual clipping for TUI scroll animation
+    // When animating, cells might be shifted outside the scroll region.
+    // We must clip them to avoid drawing over fixed headers/footers.
+    if (tui_scroll_offset_y != 0.0) {
+        float top_y = grid_padding.x + float(scroll_region_top) * cell_size.y;
+        
+        uint eff_bot = scroll_region_bot;
+        if (eff_bot == 0u) {
+            uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+            eff_bot = grid_size.y;
+        }
+        float bot_y = grid_padding.x + float(eff_bot) * cell_size.y;
+        
+        // Assume screen_pos.y increases downwards (top-left origin)
+        if (in_data.screen_pos.y < top_y || in_data.screen_pos.y >= bot_y) {
+            discard;
+        }
+    }
+
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
     
-    // Clip text that would appear outside the visible grid area during scroll
-    // This prevents edge bounce - content scrolls but edges stay clean
-    // grid_padding is {top, right, bottom, left}
-    uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-    float grid_top = grid_padding.x;  // Top padding (.x = top)
-    // Visible rows = grid_size.y - 2 (we render 2 extra rows for scroll buffer)
-    float grid_bottom = grid_top + float(grid_size.y - 2u) * cell_size.y;
-    
-    // Discard fragments outside the visible viewport (between extra rows)
-    if (in_data.screen_pos.y < grid_top || in_data.screen_pos.y > grid_bottom) {
-        discard;
-    }
+    // NOTE: For TUI smooth scrolling, clipping is handled by the scroll_blend shader.
+    // The scroll_blend shader composites prev/curr frames with proper region handling.
 
     switch (in_data.atlas) {
         default:

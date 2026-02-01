@@ -146,14 +146,11 @@ pub const Contents = struct {
         self.fg_rows.lists[self.size.rows + 1].clearRetainingCapacity();
 
         const cell = v orelse return;
-        const style = cursor_style orelse return;
+        _ = cursor_style;
 
-        switch (style) {
-            // Block cursors should be drawn first
-            .block => self.fg_rows.lists[0].appendAssumeCapacity(cell),
-            // Other cursor styles should be drawn last
-            .block_hollow, .bar, .underline, .lock => self.fg_rows.lists[self.size.rows + 1].appendAssumeCapacity(cell),
-        }
+        // For Neovide-style smooth scrolling, we put all cursor cells in list[0]
+        // so we can draw them in a separate pass.
+        self.fg_rows.lists[0].appendAssumeCapacity(cell);
     }
 
     /// Returns the current cursor glyph if present, checking both cursor lists.

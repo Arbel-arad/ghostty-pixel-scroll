@@ -5,8 +5,13 @@ const Parser = @import("../../osc.zig").Parser;
 const Command = @import("../../osc.zig").Command;
 
 /// Parse OSC 9999 - Neovim scroll hint
-/// Format: 9999;scroll=<delta>;grid=<grid>
-/// Where delta is signed integer (lines scrolled) and grid is the nvim grid ID
+/// Format: 9999;scroll=<delta>;top=<top_row>;bot=<bot_row>;grid=<grid>
+/// Where:
+///   - delta: signed integer (lines scrolled, positive = down)
+///   - top: first row of scroll region (0-indexed)
+///   - bot: last row of scroll region (exclusive, 0-indexed)
+///   - grid: nvim grid ID
+/// Rows outside [top, bot) are fixed (status bar, cmdline, etc.)
 pub fn parse(parser: *Parser, _: ?u8) ?*Command {
     const writer = parser.writer orelse {
         parser.state = .invalid;
@@ -23,9 +28,10 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
     }
 
     // Parse the key=value pairs from the data
-    // Expected format: "scroll=<int>;grid=<int>"
     var scroll_delta: ?i32 = null;
     var grid: ?i32 = null;
+    var scroll_top: ?u32 = null;
+    var scroll_bot: ?u32 = null;
 
     // Split by ';' and parse each key=value pair
     var iter = mem.splitScalar(u8, data[0 .. data.len - 1], ';');
@@ -36,11 +42,17 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
         } else if (mem.startsWith(u8, part, "grid=")) {
             const value_str = part["grid=".len..];
             grid = std.fmt.parseInt(i32, value_str, 10) catch null;
+        } else if (mem.startsWith(u8, part, "top=")) {
+            const value_str = part["top=".len..];
+            scroll_top = std.fmt.parseInt(u32, value_str, 10) catch null;
+        } else if (mem.startsWith(u8, part, "bot=")) {
+            const value_str = part["bot=".len..];
+            scroll_bot = std.fmt.parseInt(u32, value_str, 10) catch null;
         }
     }
 
-    // Both values are required
-    if (scroll_delta == null or grid == null) {
+    // scroll_delta is required, others have defaults
+    if (scroll_delta == null) {
         parser.state = .invalid;
         return null;
     }
@@ -48,7 +60,9 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
     parser.command = .{
         .nvim_scroll_hint = .{
             .scroll_delta = scroll_delta.?,
-            .grid = grid.?,
+            .grid = grid orelse 1,
+            .scroll_top = scroll_top orelse 0,
+            .scroll_bot = scroll_bot orelse 0, // 0 means "use grid height"
         },
     };
     return &parser.command;

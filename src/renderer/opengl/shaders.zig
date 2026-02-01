@@ -40,6 +40,11 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
             .step_fn = .per_instance,
             .blending_enabled = true,
         } },
+        .{ "scroll_blend", .{
+            .vertex_fn = loadShaderCode("../shaders/glsl/full_screen.v.glsl"),
+            .fragment_fn = loadShaderCode("../shaders/glsl/scroll_blend.f.glsl"),
+            .blending_enabled = false,
+        } },
     };
 
 /// All the comptime-known info about a pipeline, so that
@@ -206,6 +211,18 @@ pub const Uniforms = extern struct {
     cursor_offset_x: f32 align(4) = 0,
     cursor_offset_y: f32 align(4) = 0,
 
+    /// Scroll region for TUI smooth scrolling.
+    /// Rows outside this region don't scroll (status bar, cmdline, etc.)
+    /// scroll_region_top: first scrollable row (rows above are fixed)
+    /// scroll_region_bot: last scrollable row (rows at/below are fixed), 0 = grid height
+    scroll_region_top: u32 align(4) = 0,
+    scroll_region_bot: u32 align(4) = 0,
+
+    /// TUI scroll animation offset in pixels (Neovide-style).
+    /// This is applied to cells within the scroll region to create smooth scrolling.
+    /// Starts at the full delta and animates toward 0.
+    tui_scroll_offset_y: f32 align(4) = 0,
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,
@@ -227,7 +244,10 @@ pub const Uniforms = extern struct {
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool = false,
 
-        _padding: u28 = 0,
+        /// Whether to exclude cursor glyphs from rendering (used for scroll animation)
+        exclude_cursor: bool = false,
+
+        _padding: u27 = 0,
     };
 
     const PaddingExtend = packed struct(u32) {
@@ -306,6 +326,27 @@ pub const BgImage = extern struct {
             none = 3,
         };
     };
+};
+
+/// Uniforms for the scroll blend shader (for smooth TUI scrolling).
+/// Implements Neovide-style scrolling where border rows stay fixed.
+pub const ScrollBlendUniforms = extern struct {
+    /// Blend factor: 0.0 = all previous frame, 1.0 = all current frame
+    blend_factor: f32 align(4),
+    /// Vertical scroll offset in pixels (animates toward 0)
+    scroll_offset_y: f32 align(4),
+    /// Total screen height for UV calculations
+    screen_height: f32 align(4),
+    /// Total screen width for UV calculations
+    screen_width: f32 align(4),
+    /// Height of one cell in pixels
+    cell_height: f32 align(4),
+    /// Top of scroll region in pixels (rows above this are fixed)
+    scroll_region_top: f32 align(4),
+    /// Bottom of scroll region in pixels (rows at/below this are fixed)
+    scroll_region_bot: f32 align(4),
+    /// Top padding in pixels
+    padding_top: f32 align(4),
 };
 
 /// Initialize our custom shader pipelines. The shaders argument is a

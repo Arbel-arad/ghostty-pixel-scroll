@@ -81,6 +81,11 @@ mouse_shape: mouse_shape_pkg.MouseShape = .text,
 /// This is consumed by the renderer to animate scrolling.
 /// Positive = scroll down, negative = scroll up.
 tui_scroll_delta: i32 = 0,
+/// Top row of scroll region (rows above this don't scroll - e.g., tabline)
+tui_scroll_top: u32 = 0,
+/// Bottom row of scroll region (rows at or below don't scroll - e.g., statusline)
+/// 0 means "use grid height" (no bottom margin)
+tui_scroll_bot: u32 = 0,
 
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {

@@ -393,16 +393,22 @@ pub const Action = union(Key) {
     pub const NvimScrollHint = struct {
         scroll_delta: i32,
         grid: i32,
+        scroll_top: u32,
+        scroll_bot: u32,
 
         pub const C = extern struct {
             scroll_delta: i32,
             grid: i32,
+            scroll_top: u32,
+            scroll_bot: u32,
         };
 
         pub fn cval(self: NvimScrollHint) NvimScrollHint.C {
             return .{
                 .scroll_delta = self.scroll_delta,
                 .grid = self.grid,
+                .scroll_top = self.scroll_top,
+                .scroll_bot = self.scroll_bot,
             };
         }
     };
@@ -2060,6 +2066,8 @@ pub fn Stream(comptime Handler: type) type {
                     try self.handler.vt(.nvim_scroll_hint, .{
                         .scroll_delta = v.scroll_delta,
                         .grid = v.grid,
+                        .scroll_top = v.scroll_top,
+                        .scroll_bot = v.scroll_bot,
                     });
                 },
 

@@ -46,6 +46,9 @@ void main() {
     uvec2 cursor_pos = unpack2u16(cursor_pos_packed_2u16);
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
+    
+    // Determine effective scroll region (bot = 0 means use grid height)
+    uint effective_scroll_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
@@ -106,11 +109,35 @@ void main() {
     // Calculate the final position of the cell which uses our glyph size
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
-    // Apply pixel scroll offset for smooth scrolling
+    
+    // Apply pixel scroll offset (base grid alignment)
+    // This is required because Ghostty renders an extra row at the top for smooth scrolling
+    // so we need to shift everything up by default to hide it.
     cell_pos.y -= pixel_scroll_offset_y;
+    
+    // Apply TUI scroll animation offset (Neovide-style)
+    // This offset is ONLY applied to cells within the scroll region.
+    // Cells in the header (above scroll_region_top) or statusline (at/below scroll_region_bot)
+    // are NOT shifted - they stay fixed in place like Neovide does.
+    //
+    // The animation works like this:
+    // - When a scroll happens, tui_scroll_offset_y is set to the full delta (e.g., +16px for 1 line down)
+    // - It animates toward 0 using a spring
+    // - Cells within the scroll region are shifted by this offset, creating the sliding effect
+    // - At animation end (offset = 0), cells are in their final positions
+    if (tui_scroll_offset_y != 0.0 && grid_pos.y >= scroll_region_top && grid_pos.y < effective_scroll_bot) {
+        cell_pos.y += tui_scroll_offset_y;
+    }
     
     // Apply cursor animation offset if this is the cursor glyph
     if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
+        // If we are asked to exclude cursor (e.g. for scroll animation frame capture),
+        // discard this vertex by moving it off-screen
+        if ((bools & EXCLUDE_CURSOR) != 0u) {
+            gl_Position = vec4(-2.0, -2.0, 0.0, 1.0);
+            return;
+        }
+        
         cell_pos.x += cursor_offset_x;
         cell_pos.y += cursor_offset_y;
     }
