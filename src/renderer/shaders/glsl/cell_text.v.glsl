@@ -105,6 +105,14 @@ void main() {
     // Calculate the final position of the cell which uses our glyph size
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
+    // Apply pixel scroll offset for smooth scrolling
+    cell_pos.y -= pixel_scroll_offset_y;
+    
+    // Apply cursor animation offset if this is the cursor glyph
+    if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
+        cell_pos.x += cursor_offset_x;
+        cell_pos.y += cursor_offset_y;
+    }
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 
     // Calculate the texture coordinate in pixels. This is NOT normalized

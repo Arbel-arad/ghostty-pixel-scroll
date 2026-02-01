@@ -6,6 +6,7 @@ const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const animation = @import("../animation.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -40,6 +41,16 @@ pub const Mouse = struct {
     /// This could really just be mods in general and we probably will
     /// move it out of mouse state at some point.
     mods: inputpkg.Mods = .{},
+
+    /// Pixel scroll offset for smooth scrolling. This is the sub-line
+    /// offset in pixels (0 to cell_height). Positive values scroll the
+    /// content up (user scrolled down into history).
+    pixel_scroll_offset_y: f32 = 0,
+    
+    /// Scroll animation delta in lines. When terminal viewport scrolls by N lines,
+    /// this is set to N so the renderer can animate from old to new position.
+    /// Positive = scrolled down into history (content moves up).
+    scroll_delta_lines: f32 = 0,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

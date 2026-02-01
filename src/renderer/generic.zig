@@ -21,6 +21,7 @@ const Overlay = @import("Overlay.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
+const animation = @import("../animation.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -198,6 +199,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Our swap chain (multiple buffering)
         swap_chain: SwapChain,
+
+        /// Cursor animation state for smooth cursor movement.
+        cursor_animation: animation.CursorAnimation = .{},
+
+        /// Last known cursor grid position (for detecting cursor movement)
+        last_cursor_grid_pos: [2]u16 = .{ 0, 0 },
+
+        /// Whether cursor animation is currently active (needs continuous render)
+        cursor_animating: bool = false,
+
+        /// Scroll animation spring for smooth scrolling (position = offset in pixels from target)
+        scroll_spring: animation.Spring = .{},
+
+        /// Whether scroll animation is currently active
+        scroll_animating: bool = false,
+
+        /// Accumulated scroll offset in pixels (for sub-line input)
+        scroll_pixel_offset: f32 = 0,
 
         /// This value is used to force-update swap chain targets in the
         /// event of a config change that requires it (such as blending mode).
@@ -998,7 +1017,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if our renderer has animations so that a higher frequency
         /// timer is used.
         pub fn hasAnimations(self: *const Self) bool {
-            return self.has_custom_shaders;
+            return self.has_custom_shaders or self.cursor_animating or self.scroll_animating;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1233,9 +1252,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
+                // Copy mouse state first
+                const mouse_copy = state.mouse;
+                // Reset scroll delta (we're consuming it)
+                state.mouse.scroll_delta_lines = 0;
+                
                 break :critical .{
                     .links = links,
-                    .mouse = state.mouse,
+                    .mouse = mouse_copy,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
@@ -1348,6 +1372,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scrollbar_dirty = true;
                 }
 
+                // Update scroll animation state
+                // When terminal viewport scrolls by N lines, we get scroll_delta_lines
+                // We set the spring to animate from that offset back to 0
+                const scroll_delta = critical.mouse.scroll_delta_lines;
+                if (scroll_delta != 0) {
+                    // Add to spring position (in lines) - this is where we ARE relative to where we WANT to be
+                    self.scroll_spring.position += scroll_delta;
+                    self.scroll_animating = true;
+                }
+                
+                // Store the sub-line pixel offset
+                self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
+
                 // Update our background color
                 self.uniforms.bg_color = .{
                     self.terminal_state.colors.background.r,
@@ -1408,6 +1445,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // data we access while we're in the middle of drawing.
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
+
+            // Update cursor animation if active
+            if (self.cursor_animating) {
+                const now = std.time.Instant.now() catch null;
+                if (now) |n| {
+                    const last = self.last_frame_time orelse n;
+                    const dt_ns: f32 = @floatFromInt(n.since(last));
+                    const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
+                    
+                    self.cursor_animating = self.cursor_animation.update(dt);
+                    
+                    // Update uniform offsets
+                    const pos = self.cursor_animation.getPosition();
+                    const cursor_x = self.uniforms.cursor_pos[0];
+                    const cursor_y = self.uniforms.cursor_pos[1];
+                    if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
+                        const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
+                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                        self.uniforms.cursor_offset_x = pos.x - target_x;
+                        self.uniforms.cursor_offset_y = pos.y - target_y;
+                    }
+                    self.last_frame_time = n;
+                }
+            }
+
+            // Direct pixel scroll - just use the offset from Surface
+            // Convert pixels to lines and apply -1.0 offset for extra top row
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            self.uniforms.pixel_scroll_offset_y = cell_h - self.scroll_pixel_offset;
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
@@ -2567,6 +2633,72 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         255,
                     };
                 }
+            }
+
+
+            // Update cursor animation state
+            cursor_anim: {
+                // Get current cursor position from uniforms
+                const cursor_x = self.uniforms.cursor_pos[0];
+                const cursor_y = self.uniforms.cursor_pos[1];
+                
+                // Check if cursor position is valid (not max value which means no cursor)
+                if (cursor_x == std.math.maxInt(u16) or cursor_y == std.math.maxInt(u16)) {
+                    // No cursor visible, reset animation
+                    self.cursor_animation.snap();
+                    self.uniforms.cursor_offset_x = 0;
+                    self.uniforms.cursor_offset_y = 0;
+                    self.cursor_animating = false;
+                    break :cursor_anim;
+                }
+                
+                // Check if cursor moved
+                const last_x = self.last_cursor_grid_pos[0];
+                const last_y = self.last_cursor_grid_pos[1];
+                
+                if (cursor_x != last_x or cursor_y != last_y) {
+                    // Cursor moved - calculate pixel positions
+                    const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                    const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    
+                    const old_pixel_x: f32 = @as(f32, @floatFromInt(last_x)) * cell_width;
+                    const old_pixel_y: f32 = @as(f32, @floatFromInt(last_y)) * cell_height;
+                    const new_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
+                    const new_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
+                    
+                    // Set up animation - current position becomes offset from new target
+                    self.cursor_animation.current_x = old_pixel_x;
+                    self.cursor_animation.current_y = old_pixel_y;
+                    self.cursor_animation.setTarget(new_pixel_x, new_pixel_y, cell_width);
+                    
+                    // Update last position
+                    self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
+                    self.cursor_animating = true;
+                }
+                
+                // Update animation (calculate dt from frame timing)
+                const now = std.time.Instant.now() catch {
+                    self.uniforms.cursor_offset_x = 0;
+                    self.uniforms.cursor_offset_y = 0;
+                    break :cursor_anim;
+                };
+                
+                const last = self.last_frame_time orelse now;
+                const dt_ns: f32 = @floatFromInt(now.since(last));
+                const dt: f32 = dt_ns / std.time.ns_per_s;
+                
+                // Clamp dt to reasonable range (avoid huge jumps on first frame or after pauses)
+                const clamped_dt = @min(dt, 0.1);
+                
+                self.cursor_animating = self.cursor_animation.update(clamped_dt);
+                
+                // Calculate offset from target position
+                const pos = self.cursor_animation.getPosition();
+                const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
+                const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                
+                self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
+                self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
             }
 
             // Setup our preedit text.

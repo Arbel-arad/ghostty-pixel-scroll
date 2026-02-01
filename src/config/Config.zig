@@ -922,6 +922,16 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Enable per-pixel scrolling for high precision input devices (for example
+/// touchpads). When enabled, scrollback can move by sub-line increments
+/// instead of only whole lines. This provides a much smoother scrolling
+/// experience.
+///
+/// This only affects scrolling the terminal's own scrollback, not applications
+/// running inside the terminal (for example full-screen TUIs) that handle
+/// scrolling themselves.
+@"pixel-scroll": bool = true,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.

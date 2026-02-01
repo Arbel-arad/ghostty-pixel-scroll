@@ -197,6 +197,15 @@ pub const Uniforms = extern struct {
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
+    /// Sub-line pixel scroll offset for smooth scrolling.
+    /// Positive values scroll content up (user scrolled into history).
+    pixel_scroll_offset_y: f32 align(4) = 0,
+
+    /// Cursor position offset in pixels for smooth cursor animation.
+    /// These offsets are applied to the cursor glyph position.
+    cursor_offset_x: f32 align(4) = 0,
+    cursor_offset_y: f32 align(4) = 0,
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,

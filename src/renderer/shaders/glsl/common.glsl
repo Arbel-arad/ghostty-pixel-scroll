@@ -23,6 +23,9 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
+    uniform float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels
+    uniform float cursor_offset_x;  // Cursor animation X offset in pixels
+    uniform float cursor_offset_y;  // Cursor animation Y offset in pixels
 };
 
 // Bools

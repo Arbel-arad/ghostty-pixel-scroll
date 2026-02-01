@@ -244,6 +244,11 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Current pixel scroll offset for smooth scrolling. This is the sub-line
+    /// offset in pixels (0 to cell_height). Positive means user scrolled up
+    /// into history so content should shift up.
+    pixel_scroll_offset: f64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -312,6 +317,7 @@ const DerivedConfig = struct {
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
+    pixel_scroll: bool,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
     selection_clear_on_copy: bool,
@@ -389,6 +395,7 @@ const DerivedConfig = struct {
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
+            .pixel_scroll = config.@"pixel-scroll",
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
@@ -3386,10 +3393,14 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
-    const y: ScrollAmount = if (yoff == 0) .{} else y: {
-        // We use cell_size to determine if we have accumulated enough to trigger a scroll
-        const cell_size: f64 = @floatFromInt(self.size.cell.height);
+    // We use cell height to determine if we have accumulated enough to trigger a scroll
+    const cell_height: f64 = @floatFromInt(self.size.cell.height);
 
+    // Track if we should use pixel scrolling. Only enabled for precision devices
+    // (touchpads) when the config option is on and we're not in mouse reporting mode.
+    const use_pixel_scroll = self.config.pixel_scroll and scroll_mods.precision;
+
+    const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // If we have precision scroll, yoff is the number of pixels to scroll. In non-precision
         // scroll, yoff is the number of wheel ticks. Some mice are capable of reporting fractional
         // wheel ticks, which don't necessarily get reported as precision scrolls. We normalize all
@@ -3410,8 +3421,13 @@ pub fn scrollCallback(
             else
                 @min(yoff, -1);
 
-            break :yoff_adjusted yoff_max * cell_size * self.config.mouse_scroll_multiplier.discrete;
+            break :yoff_adjusted yoff_max * cell_height * self.config.mouse_scroll_multiplier.discrete;
         };
+
+        // For pixel scrolling, we handle this differently below
+        if (use_pixel_scroll) {
+            break :y .{};
+        }
 
         // Add our previously saved pending amount to the offset to get the
         // new offset value. The signs of the pending and yoff should match
@@ -3422,15 +3438,15 @@ pub fn scrollCallback(
 
         // If the new offset is less than a single unit of scroll, we save
         // the new pending value and do not scroll yet.
-        if (@abs(poff) < cell_size) {
+        if (@abs(poff) < cell_height) {
             self.mouse.pending_scroll_y = poff;
             break :y .{};
         }
 
         // We scroll by the number of rows in the offset and save the remainder
-        const amount = poff / cell_size;
+        const amount = poff / cell_height;
         assert(@abs(amount) >= 1);
-        self.mouse.pending_scroll_y = poff - (amount * cell_size);
+        self.mouse.pending_scroll_y = poff - (amount * cell_height);
 
         // Round towards zero.
         const delta: isize = @intFromFloat(@trunc(amount));
@@ -3535,11 +3551,75 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
+        if (use_pixel_scroll and yoff != 0) {
+            // Neovide-style smooth scrolling:
+            // 1. Scroll terminal viewport immediately
+            // 2. Set scroll_delta_lines so renderer can animate visually
+            // 3. Renderer animates from old position to new position
+            
+            const yoff_adjusted = yoff * self.config.mouse_scroll_multiplier.precision;
+            
+            // Check if we can scroll
+            const is_main_screen = self.io.terminal.screens.active_key == .primary;
+            const screen_pages = &self.io.terminal.screens.active.pages;
+            const has_history = screen_pages.total_rows > screen_pages.rows;
+            
+            if (is_main_screen and has_history) {
+                // Accumulate pixel offset (negative yoff = scroll down = positive offset)
+                self.mouse.pixel_scroll_offset -= yoff_adjusted;
+                
+                // Only scroll terminal when we've accumulated a full line
+                const max_scroll_rows = screen_pages.total_rows -| screen_pages.rows;
+                const current_vp_offset: f64 = switch (screen_pages.viewport) {
+                    .active => 0,
+                    .top => @floatFromInt(max_scroll_rows),
+                    .pin => blk: {
+                        const offset = screen_pages.viewport_pin_row_offset orelse 0;
+                        break :blk @floatFromInt(max_scroll_rows -| offset);
+                    },
+                };
+                
+                // Total visual scroll in lines
+                const total_scroll_lines = current_vp_offset + (self.mouse.pixel_scroll_offset / cell_height);
+                
+                // Clamp visual scroll to valid range
+                if (total_scroll_lines < 0) {
+                    // Hit bottom - clamp offset
+                    self.mouse.pixel_scroll_offset = -current_vp_offset * cell_height;
+                } else if (total_scroll_lines > @as(f64, @floatFromInt(max_scroll_rows))) {
+                    // Hit top - clamp offset  
+                    self.mouse.pixel_scroll_offset = (@as(f64, @floatFromInt(max_scroll_rows)) - current_vp_offset) * cell_height;
+                }
+                
+                // Scroll terminal viewport to keep content loaded
+                // Scroll when offset crosses line boundaries
+                // Keep offset in range [0, cell_height) for upward scroll (into history)
+                // and (-cell_height, 0] for downward scroll (toward active)
+                while (self.mouse.pixel_scroll_offset >= cell_height) {
+                    self.mouse.pixel_scroll_offset -= cell_height;
+                    try self.io.terminal.scrollViewport(.{ .delta = -1 });
+                }
+                while (self.mouse.pixel_scroll_offset < 0) {
+                    self.mouse.pixel_scroll_offset += cell_height;
+                    try self.io.terminal.scrollViewport(.{ .delta = 1 });
+                }
+                
+                // Update renderer state
+                self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
+            } else {
+                self.mouse.pixel_scroll_offset = 0;
+                self.renderer_state.mouse.pixel_scroll_offset_y = 0;
+            }
+        } else if (y.delta != 0) {
+            // Line-based scrolling mode
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
             try self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+
+            // Reset pixel scroll offset when using line-based scrolling
+            self.mouse.pixel_scroll_offset = 0;
+            self.renderer_state.mouse.pixel_scroll_offset_y = 0;
         }
     }
 

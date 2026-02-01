@@ -252,6 +252,14 @@ pub const Uniforms = extern struct {
         use_linear_correction: bool align(1) = false,
     },
 
+    /// Sub-line pixel scroll offset for smooth scrolling.
+    /// Positive values scroll content up (user scrolled into history).
+    pixel_scroll_offset_y: f32 align(4) = 0,
+
+    /// Cursor position offset in pixels for smooth cursor animation.
+    cursor_offset_x: f32 align(4) = 0,
+    cursor_offset_y: f32 align(4) = 0,
+
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
         right: bool = false,
