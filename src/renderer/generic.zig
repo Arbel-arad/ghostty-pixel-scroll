@@ -1266,7 +1266,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const mouse_copy = state.mouse;
                 // Reset scroll delta (we're consuming it)
                 state.mouse.scroll_delta_lines = 0;
-                
+
                 break :critical .{
                     .links = links,
                     .mouse = mouse_copy,
@@ -1354,18 +1354,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Acquire the draw mutex for all remaining state updates.
             {
-                
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
-
-                
-                
-                
-                
-                
-                
-                
-
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -1395,7 +1385,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update scroll animation state
                 // When terminal viewport scrolls by N lines, we get scroll_delta_lines
                 // We set the spring to animate from that offset back to 0
-                
+
                 // Detect scroll jumps (keyboard scrolling)
                 const scroll_jump = self.terminal_state.scroll_jump;
                 if (scroll_jump != 0) {
@@ -1403,7 +1393,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scroll_animating = true;
                 }
 
-                
                 // Store the sub-line pixel offset
                 self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
 
@@ -1473,8 +1462,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const last = self.last_frame_time orelse now;
             const dt_ns: f32 = @floatFromInt(now.since(last));
             const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
-            
-            
+
             if (self.cursor_animating or self.scroll_animating) {
                 self.last_frame_time = now;
             } else {
@@ -1484,45 +1472,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update cursor animation if active
             if (self.cursor_animating) {
                 // Time calculated above
-                
-                    
-                    
-                    
-                    
-                    const cursor_len = self.config.cursor_animation_duration;
-                    const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
-                    self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
-                    
-                    // Update uniform offsets
-                    const pos = self.cursor_animation.getPosition();
-                    const cursor_x = self.uniforms.cursor_pos[0];
-                    const cursor_y = self.uniforms.cursor_pos[1];
-                    if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                        const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
-                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
-                        self.uniforms.cursor_offset_x = pos.x - target_x;
-                        self.uniforms.cursor_offset_y = pos.y - target_y;
-                    }
-                    
+
+                const cursor_len = self.config.cursor_animation_duration;
+                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
+                self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+
+                // Update uniform offsets
+                const pos = self.cursor_animation.getPosition();
+                const cursor_x = self.uniforms.cursor_pos[0];
+                const cursor_y = self.uniforms.cursor_pos[1];
+                if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
+                    const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
+                    const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                    self.uniforms.cursor_offset_x = pos.x - target_x;
+                    self.uniforms.cursor_offset_y = pos.y - target_y;
                 }
+            }
 
             // Direct pixel scroll - just use the offset from Surface
             // Convert pixels to lines and apply -1.0 offset for extra top row
-            
-            
+
             // Spring animation for scroll jumps
             var spring_offset_px: f32 = 0;
             if (self.scroll_animating) {
                 const scroll_len = self.config.scroll_animation_duration;
                 const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
                 self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
-                spring_offset_px = self.scroll_spring.position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+
+                // Clamp spring position to max 1 line (we only have 1 extra row at each edge)
+                // This prevents black bars at edges during large scroll animations
+                // Larger scrolls will animate smoothly but cap at 1 line of visual offset
+                const max_spring_lines: f32 = 1.0;
+                const clamped_position = @max(-max_spring_lines, @min(self.scroll_spring.position, max_spring_lines));
+                spring_offset_px = clamped_position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
             }
 
             const cell_h_scroll: f32 = @floatFromInt(self.grid_metrics.cell_height);
             self.uniforms.pixel_scroll_offset_y = (cell_h_scroll - self.scroll_pixel_offset) + spring_offset_px;
-
-
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
@@ -2684,12 +2670,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-
             // Update cursor animation state
             cursor_anim: {
                 const cursor_x = self.uniforms.cursor_pos[0];
                 const cursor_y = self.uniforms.cursor_pos[1];
-                
+
                 if (cursor_x == std.math.maxInt(u16) or cursor_y == std.math.maxInt(u16)) {
                     self.cursor_animation.snap();
                     self.uniforms.cursor_offset_x = 0;
@@ -2697,33 +2682,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.cursor_animating = false;
                     break :cursor_anim;
                 }
-                
+
                 const last_x = self.last_cursor_grid_pos[0];
                 const last_y = self.last_cursor_grid_pos[1];
-                
+
                 if (cursor_x != last_x or cursor_y != last_y) {
                     const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                     const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                    
+
                     const old_pixel_x: f32 = @as(f32, @floatFromInt(last_x)) * cell_width;
                     const old_pixel_y: f32 = @as(f32, @floatFromInt(last_y)) * cell_height;
                     const new_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
                     const new_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
-                    
+
                     self.cursor_animation.current_x = old_pixel_x;
                     self.cursor_animation.current_y = old_pixel_y;
                     self.cursor_animation.setTarget(new_pixel_x, new_pixel_y, cell_width);
-                    
+
                     self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
                     self.cursor_animating = true;
                 }
-                
+
                 const pos = self.cursor_animation.getPosition();
                 const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
                 const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
                 const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
-                
+
                 self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
                 self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
             }
