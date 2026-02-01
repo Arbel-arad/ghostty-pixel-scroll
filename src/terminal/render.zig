@@ -408,11 +408,22 @@ pub const RenderState = struct {
         self.scroll_jump += @floatFromInt(tracker_diff);
         self.last_scroll_tracker = s.scroll_tracker;
 
-        // Add TUI scroll delta from Neovim OSC 9999
-        // This is a hint from Neovim about viewport scrolling within fullscreen TUI apps
+        // TUI scroll delta from Neovim OSC 9999
+        //
+        // NOTE: We intentionally do NOT use this for scroll animation currently.
+        // The problem is TUI apps redraw the entire screen instantly - there's no
+        // "old content" that smoothly scrolls into "new content". Our current
+        // pixel offset approach just shifts everything including edges, which
+        // looks bad (edges bounce).
+        //
+        // Proper smooth scroll for TUIs would need:
+        // 1. Capture previous frame to texture
+        // 2. Render new frame to another texture
+        // 3. Crossfade/blend between them during animation
+        //
+        // For now, just consume and discard the hint.
         if (t.tui_scroll_delta != 0) {
-            self.scroll_jump += @floatFromInt(t.tui_scroll_delta);
-            // Reset the delta so we don't apply it again
+            // Don't add to scroll_jump - just consume the hint
             @as(*Terminal, @constCast(t)).tui_scroll_delta = 0;
         }
 
