@@ -1761,18 +1761,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
             // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning.
-            // For normal terminal mode, this keeps an extra row hidden above viewport.
-            // For alternate screen (TUI apps like Neovim), there's no terminal scrollback,
-            // so we don't apply ANY base shift. TUI scroll animation uses tui_scroll_offset_y.
+            // Ghostty always renders with an extra row above the viewport for smooth scrollback,
+            // so we need to shift content UP by cell_h to hide it and align the grid properly.
             //
-            // IMPORTANT: We use in_alternate_screen (not tui_scroll_active) because we need
-            // to disable the scrollback offset as SOON as we enter alternate screen, not just
-            // when OSC 9999 is received. Otherwise there's a visual jump on first scroll.
+            // For alternate screen (TUI apps like Neovim), there's no mouse-driven scrollback,
+            // but we STILL need the cell_h shift to align content correctly with the viewport.
+            // The difference is we don't apply scroll_pixel_offset (mouse scroll) in alternate screen.
+            //
+            // IMPORTANT: We use in_alternate_screen (not tui_scroll_active) to ensure consistent
+            // positioning from the moment we enter alternate screen, not just when OSC 9999 is received.
             const base_offset: f32 = if (self.in_alternate_screen)
-                // Alternate screen: no base shift - no terminal scrollback in this mode
-                0.0
+                // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
+                cell_h
             else
-                // Primary screen: hide extra row above viewport for smooth scrollback
+                // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
                 cell_h - self.scroll_pixel_offset;
             self.uniforms.pixel_scroll_offset_y = base_offset;
 
