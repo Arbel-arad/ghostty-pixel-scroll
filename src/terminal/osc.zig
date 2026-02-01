@@ -152,6 +152,15 @@ pub const Command = union(Key) {
     /// Kitty text sizing protocol (OSC 66)
     kitty_text_sizing: parsers.kitty_text_sizing.OSC,
 
+    /// Neovim scroll hint (OSC 9999) - custom protocol for smooth scrolling
+    /// Sent by patched Neovim to indicate viewport scroll amount
+    nvim_scroll_hint: struct {
+        /// Number of lines scrolled (positive = down, negative = up)
+        scroll_delta: i32,
+        /// The Neovim grid ID (usually 1 for main window)
+        grid: i32,
+    },
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const Key = LibEnum(
@@ -181,6 +190,7 @@ pub const Command = union(Key) {
             "conemu_xterm_emulation",
             "conemu_comment",
             "kitty_text_sizing",
+            "nvim_scroll_hint",
         },
     );
 
@@ -340,6 +350,9 @@ pub const Parser = struct {
         @"133",
         @"777",
         @"1337",
+        @"99",
+        @"999",
+        @"9999",
     };
 
     pub fn init(alloc: ?Allocator) Parser {
@@ -397,6 +410,7 @@ pub const Parser = struct {
             .hyperlink_start,
             .invalid,
             .mouse_shape,
+            .nvim_scroll_hint,
             .report_pwd,
             .semantic_prompt,
             .show_desktop_notification,
@@ -611,8 +625,28 @@ pub const Parser = struct {
             .@"22",
             .@"777",
             .@"8",
-            .@"9",
             => switch (c) {
+                ';' => self.writeToFixed(),
+                else => self.state = .invalid,
+            },
+
+            .@"9" => switch (c) {
+                ';' => self.writeToFixed(),
+                '9' => self.state = .@"99",
+                else => self.state = .invalid,
+            },
+
+            .@"99" => switch (c) {
+                '9' => self.state = .@"999",
+                else => self.state = .invalid,
+            },
+
+            .@"999" => switch (c) {
+                '9' => self.state = .@"9999",
+                else => self.state = .invalid,
+            },
+
+            .@"9999" => switch (c) {
                 ';' => self.writeToFixed(),
                 else => self.state = .invalid,
             },
@@ -686,6 +720,10 @@ pub const Parser = struct {
             .@"777" => parsers.rxvt_extension.parse(self, terminator_ch),
 
             .@"1337" => parsers.iterm2.parse(self, terminator_ch),
+
+            .@"99", .@"999" => null,
+
+            .@"9999" => parsers.nvim_scroll.parse(self, terminator_ch),
         };
     }
 };

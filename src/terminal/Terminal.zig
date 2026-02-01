@@ -77,6 +77,11 @@ modes: modespkg.ModeState = .{},
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse_shape_pkg.MouseShape = .text,
 
+/// TUI scroll delta from Neovim OSC 9999 for smooth scrolling animation.
+/// This is consumed by the renderer to animate scrolling.
+/// Positive = scroll down, negative = scroll up.
+tui_scroll_delta: i32 = 0,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This isn't a mode, this is set by OSC 133 using the "A" event.

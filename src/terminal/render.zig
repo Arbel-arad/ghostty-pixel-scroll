@@ -91,7 +91,7 @@ pub const RenderState = struct {
     selection_cache: ?SelectionCache = null,
 
     /// Initial state.
-        scroll_jump: f32 = 0,
+    scroll_jump: f32 = 0,
     last_scroll_tracker: isize = 0,
 
     pub const empty: RenderState = .{
@@ -246,7 +246,7 @@ pub const RenderState = struct {
         br_pin: PageList.Pin,
     };
 
-        pub fn deinit(self: *RenderState, alloc: Allocator) void {
+    pub fn deinit(self: *RenderState, alloc: Allocator) void {
         for (
             self.row_data.items(.arena),
             self.row_data.items(.cells),
@@ -262,7 +262,6 @@ pub const RenderState = struct {
     ///
     /// This will reset the terminal dirty state since it is consumed
     /// by this render state update.
-    
     fn updateRow(
         self: *RenderState,
         alloc: Allocator,
@@ -286,15 +285,24 @@ pub const RenderState = struct {
 
         var is_dirty = false;
         dirty: {
-            if (redraw) { is_dirty = true; break :dirty; }
-            if (p == last_dirty_page.*) { is_dirty = true; break :dirty; }
+            if (redraw) {
+                is_dirty = true;
+                break :dirty;
+            }
+            if (p == last_dirty_page.*) {
+                is_dirty = true;
+                break :dirty;
+            }
             if (p.dirty) {
                 if (last_dirty_page.*) |last_p| last_p.dirty = false;
                 last_dirty_page.* = p;
                 is_dirty = true;
                 break :dirty;
             }
-            if (page_rac.row.dirty) { is_dirty = true; break :dirty; }
+            if (page_rac.row.dirty) {
+                is_dirty = true;
+                break :dirty;
+            }
         }
 
         if (!is_dirty) return false;
@@ -343,7 +351,6 @@ pub const RenderState = struct {
         return true;
     }
 
-    
     pub fn update(
         self: *RenderState,
         alloc: Allocator,
@@ -376,7 +383,7 @@ pub const RenderState = struct {
 
         self.rows = s.pages.rows + 2;
         self.cols = s.pages.cols;
-        
+
         // Calculate scroll jump
         self.scroll_jump = 0;
         if (self.viewport_pin) |old| {
@@ -397,10 +404,18 @@ pub const RenderState = struct {
             }
         }
 
-        
         const tracker_diff = s.scroll_tracker - self.last_scroll_tracker;
         self.scroll_jump += @floatFromInt(tracker_diff);
         self.last_scroll_tracker = s.scroll_tracker;
+
+        // Add TUI scroll delta from Neovim OSC 9999
+        // This is a hint from Neovim about viewport scrolling within fullscreen TUI apps
+        if (t.tui_scroll_delta != 0) {
+            self.scroll_jump += @floatFromInt(t.tui_scroll_delta);
+            // Reset the delta so we don't apply it again
+            // Note: We need to cast away const to do this
+            @as(*Terminal, @constCast(t)).tui_scroll_delta = 0;
+        }
 
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
@@ -505,13 +520,13 @@ pub const RenderState = struct {
             var next_pin: ?PageList.Pin = null;
             const bl_pin_opt = s.pages.getBottomRight(.viewport);
             if (bl_pin_opt) |bl_pin| {
-                 if (bl_pin.y + 1 < bl_pin.node.data.size.rows) {
-                     var p = bl_pin;
-                     p.y += 1;
-                     next_pin = p;
-                 } else if (bl_pin.node.next) |n| {
-                     next_pin = .{ .node = n, .y = 0 };
-                 }
+                if (bl_pin.y + 1 < bl_pin.node.data.size.rows) {
+                    var p = bl_pin;
+                    p.y += 1;
+                    next_pin = p;
+                } else if (bl_pin.node.next) |n| {
+                    next_pin = .{ .node = n, .y = 0 };
+                }
             }
 
             if (next_pin) |pin| {
@@ -580,7 +595,6 @@ pub const RenderState = struct {
         s.dirty = .{};
     }
 
-
     /// Update the highlights in the render state from the given flattened
     /// highlights. Because this uses flattened highlights, it does not require
     /// reading from the terminal state so it should be done outside of
@@ -588,7 +602,6 @@ pub const RenderState = struct {
     ///
     /// This will not clear any previous highlights, so the caller must
     /// manually clear them if desired.
-    
     pub fn updateHighlightsFlattened(
         self: *RenderState,
         alloc: Allocator,

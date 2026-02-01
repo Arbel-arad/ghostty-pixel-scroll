@@ -322,6 +322,7 @@ pub const StreamHandler = struct {
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
+            .nvim_scroll_hint => self.nvimScrollHint(value.scroll_delta, value.grid),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
                 @branchHint(.likely);
@@ -1034,6 +1035,17 @@ pub const StreamHandler = struct {
 
         self.terminal.mouse_shape = shape;
         self.surfaceMessageWriter(.{ .set_mouse_shape = shape });
+    }
+
+    /// Handle Neovim scroll hint (OSC 9999)
+    /// This is a custom protocol for smooth scrolling - Neovim sends scroll delta hints
+    /// which we use to animate smooth scrolling in the renderer
+    fn nvimScrollHint(self: *StreamHandler, scroll_delta: i32, grid: i32) void {
+        if (scroll_delta == 0) return;
+
+        // Store the scroll delta on the terminal for the renderer to pick up
+        self.terminal.tui_scroll_delta = scroll_delta;
+        log.debug("nvim scroll hint: delta={} grid={}", .{ scroll_delta, grid });
     }
 
     fn clipboardContents(self: *StreamHandler, kind: u8, data: []const u8) !void {

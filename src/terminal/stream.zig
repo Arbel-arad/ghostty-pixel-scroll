@@ -121,6 +121,7 @@ pub const Action = union(Key) {
     start_hyperlink: StartHyperlink,
     clipboard_contents: ClipboardContents,
     mouse_shape: MouseShape,
+    nvim_scroll_hint: NvimScrollHint,
     configure_charset: ConfigureCharset,
     set_attribute: sgr.Attribute,
     kitty_color_report: kitty.color.OSC,
@@ -218,6 +219,7 @@ pub const Action = union(Key) {
             "start_hyperlink",
             "clipboard_contents",
             "mouse_shape",
+            "nvim_scroll_hint",
             "configure_charset",
             "set_attribute",
             "kitty_color_report",
@@ -387,6 +389,23 @@ pub const Action = union(Key) {
         slot: charsets.Slots,
         charset: charsets.Charset,
     });
+
+    pub const NvimScrollHint = struct {
+        scroll_delta: i32,
+        grid: i32,
+
+        pub const C = extern struct {
+            scroll_delta: i32,
+            grid: i32,
+        };
+
+        pub fn cval(self: NvimScrollHint) NvimScrollHint.C {
+            return .{
+                .scroll_delta = self.scroll_delta,
+                .grid = self.grid,
+            };
+        }
+    };
 
     pub const ColorOperation = struct {
         op: osc.color.Operation,
@@ -2035,6 +2054,13 @@ pub fn Stream(comptime Handler: type) type {
 
                 .conemu_progress_report => |v| {
                     try self.handler.vt(.progress_report, v);
+                },
+
+                .nvim_scroll_hint => |v| {
+                    try self.handler.vt(.nvim_scroll_hint, .{
+                        .scroll_delta = v.scroll_delta,
+                        .grid = v.grid,
+                    });
                 },
 
                 .conemu_sleep,
