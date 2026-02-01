@@ -1551,6 +1551,7 @@ fn rowWillBeShifted(
 ///
 /// Moves the cursor to the left margin.
 pub fn insertLines(self: *Terminal, count: usize) void {
+    self.screens.active.scroll_tracker += @intCast(count);
     // Rare, but happens
     if (count == 0) return;
 
@@ -1751,6 +1752,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
 ///
 /// Moves the cursor to the left margin.
 pub fn deleteLines(self: *Terminal, count: usize) void {
+    self.screens.active.scroll_tracker -= @intCast(count);
     // Rare, but happens
     if (count == 0) return;
 

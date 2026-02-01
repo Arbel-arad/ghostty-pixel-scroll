@@ -1375,12 +1375,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Update scroll animation state
                 // When terminal viewport scrolls by N lines, we get scroll_delta_lines
                 // We set the spring to animate from that offset back to 0
-                const scroll_delta = critical.mouse.scroll_delta_lines;
-                if (scroll_delta != 0) {
-                    // Add to spring position (in lines) - this is where we ARE relative to where we WANT to be
-                    self.scroll_spring.position += scroll_delta;
+                
+                // Detect scroll jumps (keyboard scrolling)
+                const scroll_jump = self.terminal_state.scroll_jump;
+                if (scroll_jump != 0) {
+                    self.scroll_spring.position += scroll_jump;
                     self.scroll_animating = true;
                 }
+
                 
                 // Store the sub-line pixel offset
                 self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
@@ -1472,8 +1474,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Direct pixel scroll - just use the offset from Surface
             // Convert pixels to lines and apply -1.0 offset for extra top row
-            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-            self.uniforms.pixel_scroll_offset_y = cell_h - self.scroll_pixel_offset;
+            
+            // Spring animation for scroll jumps
+            var spring_offset_px: f32 = 0;
+            if (self.scroll_animating) {
+                const now = std.time.Instant.now() catch null;
+                if (now) |n| {
+                    const last = self.last_frame_time orelse n;
+                    const dt_ns: f32 = @floatFromInt(n.since(last));
+                    const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
+                    self.scroll_animating = self.scroll_spring.update(dt, 0.15);
+                    spring_offset_px = self.scroll_spring.position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                    
+                    if (!self.cursor_animating) self.last_frame_time = n;
+                }
+            }
+
+            // Total offset = (Cell Height - Touchpad Offset) + Jump Spring Offset
+            const cell_h_scroll: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            self.uniforms.pixel_scroll_offset_y = (cell_h_scroll - self.scroll_pixel_offset) + spring_offset_px;
+
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
