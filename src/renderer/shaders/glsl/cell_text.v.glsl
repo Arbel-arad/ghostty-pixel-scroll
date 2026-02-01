@@ -34,6 +34,7 @@ out CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    vec2 screen_pos;  // For clipping during scroll
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -114,6 +115,9 @@ void main() {
         cell_pos.y += cursor_offset_y;
     }
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+    
+    // Pass screen position for edge clipping in fragment shader
+    out_data.screen_pos = cell_pos;
 
     // Calculate the texture coordinate in pixels. This is NOT normalized
     // (between 0.0 and 1.0), and does not need to be, since the texture will

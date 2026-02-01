@@ -8,6 +8,7 @@ in CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
+    vec2 screen_pos;  // For clipping during scroll
 } in_data;
 
 // Values `atlas` can take.
@@ -20,6 +21,17 @@ layout(location = 0) out vec4 out_FragColor;
 void main() {
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
+    
+    // Clip text that would appear outside the visible grid area during scroll
+    // This prevents edge bounce - content scrolls but edges stay clean
+    uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+    float grid_top = grid_padding.w;  // Top padding
+    float grid_bottom = grid_top + float(grid_size.y - 2u) * cell_size.y;  // -2 for extra rows
+    
+    // Discard fragments outside the visible viewport (between extra rows)
+    if (in_data.screen_pos.y < grid_top || in_data.screen_pos.y > grid_bottom) {
+        discard;
+    }
 
     switch (in_data.atlas) {
         default:

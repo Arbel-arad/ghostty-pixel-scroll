@@ -413,7 +413,6 @@ pub const RenderState = struct {
         if (t.tui_scroll_delta != 0) {
             self.scroll_jump += @floatFromInt(t.tui_scroll_delta);
             // Reset the delta so we don't apply it again
-            // Note: We need to cast away const to do this
             @as(*Terminal, @constCast(t)).tui_scroll_delta = 0;
         }
 

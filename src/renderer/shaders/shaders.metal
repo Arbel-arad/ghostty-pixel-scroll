@@ -560,6 +560,7 @@ struct CellTextVertexOut {
   float4 color [[flat]];
   float4 bg_color [[flat]];
   float2 tex_coord;
+  float2 screen_pos;  // For clipping during scroll
 };
 
 vertex CellTextVertexOut cell_text_vertex(
@@ -636,6 +637,9 @@ vertex CellTextVertexOut cell_text_vertex(
   }
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+  
+  // Pass screen position for edge clipping in fragment shader
+  out.screen_pos = cell_pos;
 
   // Calculate the texture coordinate in pixels. This is NOT normalized
   // (between 0.0 and 1.0), and does not need to be, since the texture will
@@ -698,6 +702,16 @@ fragment float4 cell_text_fragment(
   texture2d<float> textureColor [[texture(1)]],
   constant Uniforms& uniforms [[buffer(1)]]
 ) {
+  // Clip text that would appear outside the visible grid area during scroll
+  // This prevents edge bounce - content scrolls but edges stay clean
+  float grid_top = uniforms.grid_padding.w;  // Top padding
+  float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;  // -2 for extra rows
+  
+  // Discard fragments outside the visible viewport (between extra rows)
+  if (in.screen_pos.y < grid_top || in.screen_pos.y > grid_bottom) {
+    discard_fragment();
+  }
+
   constexpr sampler textureSampler(
     coord::pixel,
     address::clamp_to_edge,
