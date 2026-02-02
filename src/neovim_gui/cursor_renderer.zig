@@ -146,22 +146,23 @@ pub const CursorRenderer = struct {
     }
 
     /// Set cursor position (called when Neovim sends cursor_goto)
+    /// col/row are grid coordinates (0-indexed)
     pub fn setCursorPosition(self: *Self, col: u16, row: u16, cell_w: f32, cell_h: f32) void {
         self.width = cell_w;
         self.height = cell_h;
 
-        // Destination is top-left of cursor cell
+        // Destination is top-left of cursor cell (like Neovide)
         const new_dest_x = @as(f32, @floatFromInt(col)) * cell_w;
         const new_dest_y = @as(f32, @floatFromInt(row)) * cell_h;
 
+        // Only mark as jumped if position actually changed
         if (new_dest_x != self.dest_x or new_dest_y != self.dest_y) {
+            self.prev_dest_x = self.dest_x;
+            self.prev_dest_y = self.dest_y;
+            self.dest_x = new_dest_x;
+            self.dest_y = new_dest_y;
             self.jumped = true;
         }
-
-        self.prev_dest_x = self.dest_x;
-        self.prev_dest_y = self.dest_y;
-        self.dest_x = new_dest_x;
-        self.dest_y = new_dest_y;
     }
 
     /// Update animation state
@@ -258,24 +259,18 @@ pub const CursorRenderer = struct {
     /// Get cursor offset from grid position (for shader)
     /// Returns the offset needed to move cursor from grid position to animated position
     pub fn getCursorOffset(self: *const Self) [2]f32 {
-        // Calculate center of the animated quad
-        var sum_x: f32 = 0;
-        var sum_y: f32 = 0;
-        for (self.corners) |corner| {
-            sum_x += corner.current_x;
-            sum_y += corner.current_y;
-        }
-        const center_x = sum_x / 4;
-        const center_y = sum_y / 4;
+        // The cursor glyph is rendered at the grid position (dest_x, dest_y)
+        // We need to offset it to where the animated corners currently are
 
-        // Target center
-        const target_center_x = self.dest_x + self.width / 2;
-        const target_center_y = self.dest_y + self.height / 2;
+        // Calculate the top-left of the animated quad (average of corners, adjusted)
+        // Since corners are relative to CENTER, the top-left corner[0] gives us the actual top-left
+        const animated_x = self.corners[0].current_x;
+        const animated_y = self.corners[0].current_y;
 
-        // Offset = animated center - target center
+        // Offset = where cursor IS now - where cursor SHOULD be (grid position)
         return .{
-            center_x - target_center_x,
-            center_y - target_center_y,
+            animated_x - self.dest_x,
+            animated_y - self.dest_y,
         };
     }
 
@@ -286,7 +281,7 @@ pub const CursorRenderer = struct {
         return (@cos(phase) + 1.0) / 2.0;
     }
 
-    /// Snap cursor to position immediately
+    /// Snap cursor to position immediately (no animation)
     pub fn snap(self: *Self, col: u16, row: u16, cell_w: f32, cell_h: f32) void {
         self.width = cell_w;
         self.height = cell_h;
@@ -295,16 +290,20 @@ pub const CursorRenderer = struct {
         self.prev_dest_x = self.dest_x;
         self.prev_dest_y = self.dest_y;
 
+        // Corners are positioned relative to CENTER of cursor
         const center_x = self.dest_x + self.width / 2;
         const center_y = self.dest_y + self.height / 2;
 
         for (&self.corners) |*corner| {
+            // Each corner position = center + relative_offset * dimensions
             corner.current_x = center_x + corner.relative_x * self.width;
             corner.current_y = center_y + corner.relative_y * self.height;
             corner.prev_dest_x = corner.current_x;
             corner.prev_dest_y = corner.current_y;
             corner.spring_x.position = 0;
             corner.spring_y.position = 0;
+            corner.spring_x.velocity = 0;
+            corner.spring_y.velocity = 0;
         }
 
         self.jumped = false;

@@ -1818,6 +1818,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const default_fg = nvim.default_foreground;
             const default_bg = nvim.default_background;
 
+            // Fill entire grid with default background color first
+            // This ensures no gaps even if Neovim windows don't cover everything
+            const bg_r: u8 = @intCast((default_bg >> 16) & 0xFF);
+            const bg_g: u8 = @intCast((default_bg >> 8) & 0xFF);
+            const bg_b: u8 = @intCast(default_bg & 0xFF);
+            for (0..rows) |y| {
+                for (0..cols) |x| {
+                    self.cells.bgCell(y, x).* = .{ bg_r, bg_g, bg_b, 255 };
+                }
+            }
+
             // Collect windows and sort by z-index for proper layering
             // Lower z-index windows render first, higher ones on top
             var windows_to_render = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
