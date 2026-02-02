@@ -1738,7 +1738,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Update cursor animation - NEOVIDE STYLE smooth cursor movement
+            // Update Neovide-style cursor renderer (4-corner trail animation)
+            if (nvim.cursor_renderer.update(dt)) {
+                any_animating = true;
+            }
+
+            // Also update legacy cursor animation for compatibility
             if (self.cursor_animating) {
                 const cursor_len = self.config.cursor_animation_duration;
                 const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
@@ -1749,7 +1754,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Keep rendering while animating for smooth 60fps+ scrolling/cursor
-            self.scroll_animating = any_animating or self.cursor_animating;
+            self.scroll_animating = any_animating or self.cursor_animating or nvim.cursor_renderer.animating;
 
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
@@ -1817,8 +1822,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Collect windows and sort by z-index for proper layering
             // Lower z-index windows render first, higher ones on top
-            var windows_to_render = std.ArrayList(*neovim_gui.RenderedWindow).init(self.alloc);
-            defer windows_to_render.deinit();
+            var windows_to_render = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
+            defer windows_to_render.deinit(self.alloc);
 
             var window_iter = nvim.windows.valueIterator();
             while (window_iter.next()) |window_ptr| {
@@ -1826,7 +1831,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (window.hidden or !window.valid) continue;
                 if (window.grid_height == 0 or window.grid_width == 0) continue;
                 if (window.cells.len == 0) continue;
-                windows_to_render.append(window) catch continue;
+                windows_to_render.append(self.alloc, window) catch continue;
             }
 
             // Sort by z-index (lower first, so higher z-index renders on top)
@@ -1891,7 +1896,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.renderNeovimCursor(nvim, default_fg, default_bg);
         }
 
-        /// Render the Neovim cursor with smooth animation
+        /// Render the Neovim cursor with Neovide-style trail animation
         fn renderNeovimCursor(self: *Self, nvim: *neovim_gui.NeovimGui, default_fg: u32, default_bg: u32) void {
             _ = default_bg;
             const cursor_row: u16 = @intCast(nvim.cursor_row);
@@ -1902,37 +1907,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Set cursor position in uniforms (grid coordinates)
             self.uniforms.cursor_pos = .{ cursor_col, cursor_row };
 
-            // CURSOR ANIMATION: Detect position change and trigger animation
             const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
             const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            const last_x = self.last_cursor_grid_pos[0];
-            const last_y = self.last_cursor_grid_pos[1];
+            // Get cursor corners from the Neovide-style cursor renderer
+            const cursor_renderer = &nvim.cursor_renderer;
+            const corners = cursor_renderer.getCorners();
 
-            if (cursor_col != last_x or cursor_row != last_y) {
-                // Cursor moved - start animation from old position to new
-                const old_pixel_x: f32 = @as(f32, @floatFromInt(last_x)) * cell_width;
-                const old_pixel_y: f32 = @as(f32, @floatFromInt(last_y)) * cell_height;
-                const new_pixel_x: f32 = @as(f32, @floatFromInt(cursor_col)) * cell_width;
-                const new_pixel_y: f32 = @as(f32, @floatFromInt(cursor_row)) * cell_height;
+            // Calculate the bounding box of the cursor trail
+            var min_x: f32 = corners[0][0];
+            var max_x: f32 = corners[0][0];
+            var min_y: f32 = corners[0][1];
+            var max_y: f32 = corners[0][1];
 
-                self.cursor_animation.current_x = old_pixel_x;
-                self.cursor_animation.current_y = old_pixel_y;
-                self.cursor_animation.setTarget(new_pixel_x, new_pixel_y, cell_width);
-
-                self.last_cursor_grid_pos = .{ cursor_col, cursor_row };
-                self.cursor_animating = true;
+            for (corners) |corner| {
+                min_x = @min(min_x, corner[0]);
+                max_x = @max(max_x, corner[0]);
+                min_y = @min(min_y, corner[1]);
+                max_y = @max(max_y, corner[1]);
             }
 
-            // Update cursor offset uniforms from animation state
-            const pos = self.cursor_animation.getPosition();
+            // Calculate cursor offset from grid position (for trail effect)
             const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_col)) * cell_width;
             const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_row)) * cell_height;
-            self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
-            self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
 
-            // Render cursor glyph using the proper cursor rendering system
-            // This ensures the cursor_offset_x/y uniforms are applied via IS_CURSOR_GLYPH
+            // The offset is the difference between the center of the cursor trail
+            // and the target grid position
+            const center_x = (min_x + max_x) / 2 - cell_width / 2;
+            const center_y = (min_y + max_y) / 2 - cell_height / 2;
+            self.uniforms.cursor_offset_x = center_x - target_pixel_x;
+            self.uniforms.cursor_offset_y = center_y - target_pixel_y;
+
+            // Get blink opacity for smooth blink
+            const blink_alpha: u8 = @intFromFloat(cursor_renderer.getBlinkOpacity() * 255);
+            _ = blink_alpha; // TODO: Apply blink to cursor
+
+            // Set cursor animating flag
+            self.cursor_animating = cursor_renderer.animating;
+
+            // Render cursor glyph
             const cursor_color_rgb = terminal.color.RGB{
                 .r = @intCast((default_fg >> 16) & 0xFF),
                 .g = @intCast((default_fg >> 8) & 0xFF),
@@ -1966,6 +1979,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_y),
                 },
             }, .block);
+
+            // TODO: Render particles from cursor_renderer.particles
         }
 
         /// Add a glyph from Neovim cell content

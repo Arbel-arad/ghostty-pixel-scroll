@@ -23,6 +23,8 @@ pub const ScrollCommand = @import("rendered_window.zig").ScrollCommand;
 pub const GridCell = @import("rendered_window.zig").GridCell;
 pub const Animation = @import("animation.zig");
 pub const nvim_input = @import("input.zig");
+pub const CursorRenderer = @import("cursor_renderer.zig").CursorRenderer;
+pub const VfxMode = @import("cursor_renderer.zig").VfxMode;
 
 const log = std.log.scoped(.neovim_gui);
 
@@ -78,6 +80,9 @@ pub const NeovimGui = struct {
 
     /// Current mode index
     current_mode_idx: u64 = 0,
+
+    /// Neovide-style cursor renderer with trail and particles
+    cursor_renderer: CursorRenderer = CursorRenderer.init(),
 
     pub fn init(alloc: Allocator) !*Self {
         const self = try alloc.create(Self);
@@ -254,6 +259,13 @@ pub const NeovimGui = struct {
                 self.cursor_grid = data.grid;
                 self.cursor_row = data.row;
                 self.cursor_col = data.col;
+                // Update cursor renderer with new position
+                self.cursor_renderer.setCursorPosition(
+                    @intCast(data.col),
+                    @intCast(data.row),
+                    self.cell_width,
+                    self.cell_height,
+                );
                 self.dirty = true;
             },
             .win_pos => |data| {

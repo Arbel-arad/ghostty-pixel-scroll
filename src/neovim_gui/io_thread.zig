@@ -948,9 +948,9 @@ fn extractF32(val: Payload) ?f32 {
     };
 }
 
-fn extractBool(val: Payload) ?bool {
+fn extractBool(val: Payload) bool {
     return switch (val) {
         .bool => |v| v,
-        else => null,
+        else => false,
     };
 }

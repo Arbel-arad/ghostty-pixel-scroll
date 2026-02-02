@@ -84,6 +84,13 @@ pub const RenderedWindow = struct {
     /// Position in grid coordinates (col, row)
     grid_position: [2]f32 = .{ 0, 0 },
 
+    /// Target position for animation
+    target_position: [2]f32 = .{ 0, 0 },
+
+    /// Position animation springs
+    position_spring_x: Animation.CriticallyDampedSpring = .{},
+    position_spring_y: Animation.CriticallyDampedSpring = .{},
+
     /// Z-index for floating windows (higher = on top)
     zindex: u64 = 0,
 
@@ -101,6 +108,7 @@ pub const RenderedWindow = struct {
 
     /// Animation settings
     scroll_animation_length: f32 = 0.3,
+    position_animation_length: f32 = 0.15,
 
     /// Dirty flag - set when content changes
     dirty: bool = true,
@@ -170,7 +178,17 @@ pub const RenderedWindow = struct {
     }
 
     pub fn setPosition(self: *Self, row: u64, col: u64, width: u64, height: u64) void {
-        self.grid_position = .{ @floatFromInt(col), @floatFromInt(row) };
+        const new_x: f32 = @floatFromInt(col);
+        const new_y: f32 = @floatFromInt(row);
+
+        // If position changed, animate to new position
+        if (new_x != self.target_position[0] or new_y != self.target_position[1]) {
+            // Set spring to animate from current to target
+            self.position_spring_x.position = self.grid_position[0] - new_x;
+            self.position_spring_y.position = self.grid_position[1] - new_y;
+            self.target_position = .{ new_x, new_y };
+        }
+
         _ = width;
         _ = height;
         self.valid = true;
@@ -179,7 +197,16 @@ pub const RenderedWindow = struct {
     }
 
     pub fn setFloatPosition(self: *Self, row: u64, col: u64, zindex: u64) void {
-        self.grid_position = .{ @floatFromInt(col), @floatFromInt(row) };
+        const new_x: f32 = @floatFromInt(col);
+        const new_y: f32 = @floatFromInt(row);
+
+        // If position changed, animate to new position
+        if (new_x != self.target_position[0] or new_y != self.target_position[1]) {
+            self.position_spring_x.position = self.grid_position[0] - new_x;
+            self.position_spring_y.position = self.grid_position[1] - new_y;
+            self.target_position = .{ new_x, new_y };
+        }
+
         self.valid = true;
         self.hidden = false;
         self.zindex = zindex;
@@ -326,7 +353,26 @@ pub const RenderedWindow = struct {
 
     /// Animate the window, returns true if still animating
     pub fn animate(self: *Self, dt: f32) bool {
-        return self.scroll_animation.update(dt, self.scroll_animation_length, 1.0);
+        var animating = false;
+
+        // Animate scroll
+        if (self.scroll_animation.update(dt, self.scroll_animation_length, 0)) {
+            animating = true;
+        }
+
+        // Animate position (window movement)
+        if (self.position_spring_x.update(dt, self.position_animation_length, 0)) {
+            animating = true;
+        }
+        if (self.position_spring_y.update(dt, self.position_animation_length, 0)) {
+            animating = true;
+        }
+
+        // Update grid_position from springs
+        self.grid_position[0] = self.target_position[0] + self.position_spring_x.position;
+        self.grid_position[1] = self.target_position[1] + self.position_spring_y.position;
+
+        return animating;
     }
 
     /// Get scroll offset in whole lines
@@ -342,6 +388,8 @@ pub const RenderedWindow = struct {
 
     /// Check if window is currently animating
     pub fn isAnimating(self: *const Self) bool {
-        return self.scroll_animation.position != 0.0;
+        return self.scroll_animation.position != 0.0 or
+            self.position_spring_x.position != 0.0 or
+            self.position_spring_y.position != 0.0;
     }
 };
