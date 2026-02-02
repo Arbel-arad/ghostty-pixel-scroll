@@ -1762,11 +1762,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Get cell height for pixel offset calculation
             const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            // NEOVIM GUI MODE: Match terminal mode's grid alignment
-            // Terminal mode shifts content UP by cell_height to hide an extra row.
-            // Even though we don't have that extra row in Neovim mode, the projection
-            // matrix and padding calculations expect this offset for proper alignment.
-            self.uniforms.pixel_scroll_offset_y = cell_height;
+            // NEOVIM GUI MODE: No extra row to hide
+            // Terminal mode shifts content UP by cell_height to hide an extra row used for
+            // smooth scrollback, but in Neovim GUI mode we don't have that extra row.
+            // Setting to 0 means content renders at its natural grid position.
+            self.uniforms.pixel_scroll_offset_y = 0;
 
             // NEOVIDE-STYLE SMOOTH SCROLLING:
             // The scroll_animation.position represents how many lines we're "behind"
@@ -1907,43 +1907,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Set cursor position in uniforms (grid coordinates)
             self.uniforms.cursor_pos = .{ cursor_col, cursor_row };
 
-            const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
-            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
-
-            // Get cursor corners from the Neovide-style cursor renderer
+            // Get cursor offset from the Neovide-style cursor renderer
             const cursor_renderer = &nvim.cursor_renderer;
-            const corners = cursor_renderer.getCorners();
+            const offset = cursor_renderer.getCursorOffset();
 
-            // Calculate the bounding box of the cursor trail
-            var min_x: f32 = corners[0][0];
-            var max_x: f32 = corners[0][0];
-            var min_y: f32 = corners[0][1];
-            var max_y: f32 = corners[0][1];
-
-            for (corners) |corner| {
-                min_x = @min(min_x, corner[0]);
-                max_x = @max(max_x, corner[0]);
-                min_y = @min(min_y, corner[1]);
-                max_y = @max(max_y, corner[1]);
-            }
-
-            // Calculate cursor offset from grid position (for trail effect)
-            const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_col)) * cell_width;
-            const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_row)) * cell_height;
-
-            // The offset is the difference between the center of the cursor trail
-            // and the target grid position
-            const center_x = (min_x + max_x) / 2 - cell_width / 2;
-            const center_y = (min_y + max_y) / 2 - cell_height / 2;
-            self.uniforms.cursor_offset_x = center_x - target_pixel_x;
-            self.uniforms.cursor_offset_y = center_y - target_pixel_y;
-
-            // Get blink opacity for smooth blink
-            const blink_alpha: u8 = @intFromFloat(cursor_renderer.getBlinkOpacity() * 255);
-            _ = blink_alpha; // TODO: Apply blink to cursor
+            self.uniforms.cursor_offset_x = offset[0];
+            self.uniforms.cursor_offset_y = offset[1];
 
             // Set cursor animating flag
             self.cursor_animating = cursor_renderer.animating;
+
+            // Get blink opacity for smooth blink
+            const blink_opacity = cursor_renderer.getBlinkOpacity();
+            const alpha: u8 = @intFromFloat(blink_opacity * 255);
 
             // Render cursor glyph
             const cursor_color_rgb = terminal.color.RGB{
@@ -1971,7 +1947,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
                 .grid_pos = .{ cursor_col, cursor_row },
-                .color = .{ cursor_color_rgb.r, cursor_color_rgb.g, cursor_color_rgb.b, 255 },
+                .color = .{ cursor_color_rgb.r, cursor_color_rgb.g, cursor_color_rgb.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -1979,8 +1955,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_y),
                 },
             }, .block);
-
-            // TODO: Render particles from cursor_renderer.particles
         }
 
         /// Add a glyph from Neovim cell content

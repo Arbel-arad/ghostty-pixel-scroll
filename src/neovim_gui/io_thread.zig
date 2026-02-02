@@ -754,7 +754,7 @@ pub const IoThread = struct {
                     .anchor_grid = extractU64(args[3]) orelse 1,
                     .anchor_row = extractF32(args[4]) orelse 0,
                     .anchor_col = extractF32(args[5]) orelse 0,
-                    .focusable = extractBool(args[6]) orelse true,
+                    .focusable = extractBool(args[6]),
                     .zindex = extractU64(args[7]) orelse 50,
                 } });
             }
