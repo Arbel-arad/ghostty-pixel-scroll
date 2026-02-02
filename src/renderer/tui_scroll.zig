@@ -451,7 +451,7 @@ pub const TuiScrollback = struct {
         const scroll_right = self.scroll_region_right;
         const full_width = scroll_left == 0 and scroll_right == self.grid_columns;
 
-        // Only render the actual scroll region rows (no extra row needed)
+        // Render inner_size rows at their normal grid positions (within scroll region)
         for (0..inner_size) |i_usize| {
             const i: isize = @intCast(i_usize);
 
@@ -462,52 +462,153 @@ pub const TuiScrollback = struct {
             // Determine target logical grid row (visual position)
             const grid_row_signed = @as(isize, @intCast(self.scroll_region_top)) + i;
 
-            // Bounds check
-            if (grid_row_signed >= 0 and grid_row_signed < self.grid_rows) {
-                const grid_row: usize = @intCast(grid_row_signed);
+            // Bounds check - must be within grid
+            if (grid_row_signed < 0 or grid_row_signed >= self.grid_rows) continue;
+            const grid_row: usize = @intCast(grid_row_signed);
 
-                // For inner rows, overwrite scroll region only for partial-width scrolls
-                const bg_start = grid_row * cells.size.columns;
-                const bg_end = bg_start + cells.size.columns;
-                if (bg_end <= cells.bg_cells.len and scrollback_row.columns == cells.size.columns) {
-                    if (full_width) {
-                        @memcpy(cells.bg_cells[bg_start..bg_end], scrollback_row.bg_cells);
-                    } else if (scroll_left < scroll_right and scroll_right <= cells.size.columns) {
-                        const row_start = bg_start + scroll_left;
-                        const row_end = bg_start + scroll_right;
-                        @memcpy(cells.bg_cells[row_start..row_end], scrollback_row.bg_cells[scroll_left..scroll_right]);
-                    }
+            // Copy background cells
+            const bg_start = grid_row * cells.size.columns;
+            const bg_end = bg_start + cells.size.columns;
+            if (bg_end <= cells.bg_cells.len and scrollback_row.columns == cells.size.columns) {
+                if (full_width) {
+                    @memcpy(cells.bg_cells[bg_start..bg_end], scrollback_row.bg_cells);
+                } else if (scroll_left < scroll_right and scroll_right <= cells.size.columns) {
+                    const row_start = bg_start + scroll_left;
+                    const row_end = bg_start + scroll_right;
+                    @memcpy(cells.bg_cells[row_start..row_end], scrollback_row.bg_cells[scroll_left..scroll_right]);
                 }
+            }
 
-                // Foreground
-                const fg_row_index = grid_row + 1;
-                if (fg_row_index < cells.fg_rows.lists.len) {
-                    const dest_list = &cells.fg_rows.lists[fg_row_index];
-                    dest_list.clearRetainingCapacity();
+            // Copy foreground cells
+            const fg_row_index = grid_row + 1;
+            if (fg_row_index < cells.fg_rows.lists.len) {
+                const dest_list = &cells.fg_rows.lists[fg_row_index];
+                dest_list.clearRetainingCapacity();
 
-                    if (full_width) {
-                        for (scrollback_row.fg_cells.items) |cell_text| {
-                            var adjusted = cell_text;
-                            adjusted.grid_pos[1] = @intCast(grid_row);
-                            try dest_list.append(self.alloc, adjusted);
-                        }
-                    } else {
-                        const current_row = self.getRow(@intCast(i));
-                        if (current_row) |row_ptr| {
-                            for (row_ptr.fg_cells.items) |cell_text| {
-                                if (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right) {
-                                    var adjusted = cell_text;
-                                    adjusted.grid_pos[1] = @intCast(grid_row);
-                                    try dest_list.append(self.alloc, adjusted);
-                                }
-                            }
-                        }
-                        for (scrollback_row.fg_cells.items) |cell_text| {
-                            if (cell_text.grid_pos[0] >= scroll_left and cell_text.grid_pos[0] < scroll_right) {
+                if (full_width) {
+                    for (scrollback_row.fg_cells.items) |cell_text| {
+                        var adjusted = cell_text;
+                        adjusted.grid_pos[1] = @intCast(grid_row);
+                        try dest_list.append(self.alloc, adjusted);
+                    }
+                } else {
+                    const current_row = self.getRow(@intCast(i));
+                    if (current_row) |row_ptr| {
+                        for (row_ptr.fg_cells.items) |cell_text| {
+                            if (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right) {
                                 var adjusted = cell_text;
                                 adjusted.grid_pos[1] = @intCast(grid_row);
                                 try dest_list.append(self.alloc, adjusted);
                             }
+                        }
+                    }
+                    for (scrollback_row.fg_cells.items) |cell_text| {
+                        if (cell_text.grid_pos[0] >= scroll_left and cell_text.grid_pos[0] < scroll_right) {
+                            var adjusted = cell_text;
+                            adjusted.grid_pos[1] = @intCast(grid_row);
+                            try dest_list.append(self.alloc, adjusted);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle the extra "sliding in" row during animation.
+        // When scrolling, one row slides OUT of the scroll region while another slides IN.
+        // The sliding-in row needs to be rendered at a position just outside the scroll region,
+        // and the vertex shader will shift it into view while the fragment shader clips it.
+        //
+        // For scroll DOWN (pos < 0, offset_lines = -1):
+        //   - We read buffer[-1, 0, 1, ..., inner_size-2] for the main content
+        //   - But we ALSO need buffer[inner_size-1] (the NEW bottom row sliding in)
+        //   - This extra row should appear at grid_pos = scroll_region_bot (below scroll region)
+        //   - Shader shifts it UP into view from the bottom
+        //
+        // For scroll UP (pos > 0, offset_lines = +1):
+        //   - We read buffer[1, 2, ..., inner_size] for the main content
+        //   - But we ALSO need buffer[0] (which is the OLD top row sliding in)
+        //   - Actually with rotation, buffer[0] after scroll UP contains the row that was
+        //     at the bottom before, which is the NEW content. The OLD content we need
+        //     is at buffer[-1] after rotation... no wait.
+        //
+        // Let me re-trace for scroll UP:
+        //   - scroll_offset_lines = floor(0.96) = 0 (wait, that's not +1!)
+        //   - Actually when pos is between 0 and 1, floor(pos) = 0
+        //   - So offset_lines = 0, and we read buffer[0, 1, ..., inner_size-1]
+        //   - That's exactly the NEW content! No extra row needed at that point.
+        //   - When pos > 1, we'd be scrolling multiple lines at once...
+        //
+        // Actually, the animation position starts at -delta for scroll. For scroll DOWN delta=1,
+        // position starts at -1 and animates toward 0. For scroll UP delta=-1, position starts
+        // at +1 and animates toward 0.
+        //
+        // So for scroll DOWN with position in range (-1, 0):
+        //   - offset_lines = floor(pos) = -1
+        //   - We read buffer[-1, 0, ..., inner_size-2]
+        //   - We need buffer[inner_size-1] as the extra row at the bottom
+        //
+        // For scroll UP with position in range (0, 1):
+        //   - offset_lines = floor(pos) = 0
+        //   - We read buffer[0, 1, ..., inner_size-1]
+        //   - We need buffer[-1] as the extra row at the top (the OLD row that scrolled off)
+        //   - Wait, but buffer[-1] after scroll UP rotation would be... let me think.
+        //
+        // After scroll UP by 1 (delta=-1), we rotate(-1):
+        //   - Old buffer[0] → now at buffer[1]
+        //   - Old buffer[-1] (which wrapped to inner_size-1) → now at buffer[0]
+        //   - So buffer[-1] after rotation is the OLD buffer[-2]
+        //
+        // Hmm, this is getting confusing. Let me just focus on making the sliding row work.
+
+        // For scroll DOWN: extra row at the bottom (buffer index inner_size-1)
+        if (scroll_offset_lines < 0) {
+            // The extra row index: when offset=-1 and we read 0..inner_size-1 relative,
+            // that's buffer indices -1..inner_size-2. The missing row is inner_size-1.
+            const extra_buffer_index: isize = @intCast(inner_size - 1);
+            if (self.getRow(extra_buffer_index)) |extra_scrollback_row| {
+                // Add these cells with grid_pos at scroll_region_bot
+                // The shader will shift them up into view and clip appropriately
+                const target_grid_row = self.scroll_region_bot;
+                if (target_grid_row < self.grid_rows) {
+                    // Use the row's fg_list to add these cells
+                    const fg_row_index = self.scroll_region_bot; // Using bot as it's right after the last scroll row
+                    if (fg_row_index < cells.fg_rows.lists.len) {
+                        const dest_list = &cells.fg_rows.lists[fg_row_index];
+                        // Don't clear - this might have statusline content
+                        for (extra_scrollback_row.fg_cells.items) |cell_text| {
+                            if (!full_width and (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right)) {
+                                continue;
+                            }
+                            var adjusted = cell_text;
+                            adjusted.grid_pos[1] = @intCast(target_grid_row);
+                            // Set is_scroll_glyph flag so shader applies tui_scroll_offset_y
+                            // even though this cell is outside the scroll region bounds
+                            adjusted.bools.is_scroll_glyph = true;
+                            try dest_list.append(self.alloc, adjusted);
+                        }
+                    }
+                }
+            }
+        } else if (scroll_offset_lines > 0) {
+            // Scrolling UP - extra row slides in from top
+            const extra_buffer_index: isize = scroll_offset_lines - 1;
+            if (self.getRow(extra_buffer_index)) |extra_scrollback_row| {
+                // Add these cells with grid_pos at scroll_region_top - 1
+                if (self.scroll_region_top > 0) {
+                    const target_grid_row = self.scroll_region_top - 1;
+                    const fg_row_index = target_grid_row + 1;
+                    if (fg_row_index < cells.fg_rows.lists.len) {
+                        const dest_list = &cells.fg_rows.lists[fg_row_index];
+                        for (extra_scrollback_row.fg_cells.items) |cell_text| {
+                            if (!full_width and (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right)) {
+                                continue;
+                            }
+                            var adjusted = cell_text;
+                            adjusted.grid_pos[1] = @intCast(target_grid_row);
+                            // Set is_scroll_glyph flag so shader applies tui_scroll_offset_y
+                            // even though this cell is outside the scroll region bounds
+                            adjusted.bools.is_scroll_glyph = true;
+                            try dest_list.append(self.alloc, adjusted);
                         }
                     }
                 }
