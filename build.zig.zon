@@ -113,6 +113,13 @@
             .lazy = true,
         },
 
+        // Neovim GUI mode
+        .znvim = .{
+            .url = "https://github.com/jinzhongjia/znvim/archive/main.tar.gz",
+            .hash = "znvim-1.0.0-M-MdgsUFDAA2r8zQbdbghZNktEZT79aAvdqJBb4ctwVS",
+            .lazy = true,
+        },
+
         // Other
         .apple_sdk = .{ .path = "./pkg/apple-sdk" },
         .iterm2_themes = .{

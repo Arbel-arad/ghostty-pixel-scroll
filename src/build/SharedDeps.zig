@@ -421,6 +421,14 @@ pub fn add(
         step.root_module.addImport("zf", dep.module("zf"));
     }
 
+    // Neovim GUI mode - znvim RPC client
+    if (b.lazyDependency("znvim", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        step.root_module.addImport("znvim", dep.module("znvim"));
+    }
+
     // Mac Stuff
     if (step.rootModuleTarget().os.tag.isDarwin()) {
         if (b.lazyDependency("zig_objc", .{

@@ -23,6 +23,7 @@ const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
 const animation = @import("../animation.zig");
 const tui_scroll = @import("tui_scroll.zig");
+const neovim_gui = @import("../neovim_gui/main.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -264,6 +265,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The render state we update per loop.
         terminal_state: terminal.RenderState = .empty,
+
+        /// Neovim GUI mode state. When set, the renderer reads from Neovim
+        /// windows instead of terminal_state.
+        nvim_gui: ?*neovim_gui.NeovimGui = null,
 
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
@@ -1220,6 +1225,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// True if our renderer has animations so that a higher frequency
         /// timer is used.
         pub fn hasAnimations(self: *const Self) bool {
+            // In Neovim GUI mode, always run at high refresh rate for
+            // smooth cursor, scrolling, and instant visual feedback
+            if (self.nvim_gui != null) return true;
             return self.has_custom_shaders or self.cursor_animating or self.scroll_animating;
         }
 
@@ -1343,6 +1351,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //         .{ start_micro, end.since(start) / std.time.ns_per_us },
             //     );
             // }
+
+            // Update nvim_gui pointer from state
+            self.nvim_gui = state.nvim_gui;
+
+            // If in Neovim GUI mode, use a separate update path
+            if (self.nvim_gui) |nvim| {
+                try self.updateFrameNeovim(nvim);
+                return;
+            }
 
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
@@ -1693,6 +1710,355 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Notify our shaper we're done for the frame. For some shapers,
             // such as CoreText, this triggers off-thread cleanup logic.
             self.font_shaper.endFrame();
+        }
+
+        /// Update frame for Neovim GUI mode.
+        /// This is a separate code path that reads from Neovim windows instead of terminal state.
+        fn updateFrameNeovim(self: *Self, nvim: *neovim_gui.NeovimGui) !void {
+            // Process any pending Neovim events - this is the hot path
+            nvim.processEvents() catch {};
+
+            // Calculate time delta for smooth scroll animation
+            const now = std.time.Instant.now() catch {
+                self.last_frame_time = null;
+                return;
+            };
+            const dt: f32 = if (self.last_frame_time) |last| blk: {
+                const ns: f32 = @floatFromInt(now.since(last));
+                break :blk @min(ns / std.time.ns_per_s, 0.1); // Cap at 100ms
+            } else 1.0 / 60.0; // Default to 60fps
+            self.last_frame_time = now;
+
+            // Update scroll animations for all windows - NEOVIDE STYLE
+            var any_animating = false;
+            var window_iter = nvim.windows.valueIterator();
+            while (window_iter.next()) |window_ptr| {
+                if (window_ptr.*.animate(dt)) {
+                    any_animating = true;
+                }
+            }
+
+            // Update cursor animation - NEOVIDE STYLE smooth cursor movement
+            if (self.cursor_animating) {
+                const cursor_len = self.config.cursor_animation_duration;
+                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
+                self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+                if (self.cursor_animating) {
+                    any_animating = true;
+                }
+            }
+
+            // Keep rendering while animating for smooth 60fps+ scrolling/cursor
+            self.scroll_animating = any_animating or self.cursor_animating;
+
+            self.draw_mutex.lock();
+            defer self.draw_mutex.unlock();
+
+            // Get cell height for pixel offset calculation
+            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+            // NEOVIM GUI MODE: Match terminal mode's grid alignment
+            // Terminal mode shifts content UP by cell_height to hide an extra row.
+            // Even though we don't have that extra row in Neovim mode, the projection
+            // matrix and padding calculations expect this offset for proper alignment.
+            self.uniforms.pixel_scroll_offset_y = cell_height;
+
+            // NEOVIDE-STYLE SMOOTH SCROLLING:
+            // The scroll_animation.position represents how many lines we're "behind"
+            // Multiply by cell height to get pixel offset
+            if (nvim.getWindow(1)) |main_window| {
+                // Position is in lines, convert to pixels
+                // Negative position = content should move UP (we scrolled down, showing new content below)
+                // So we ADD the offset to shift content up
+                const scroll_pixels = main_window.scroll_animation.position * cell_height;
+                self.uniforms.tui_scroll_offset_y = scroll_pixels;
+            } else {
+                self.uniforms.tui_scroll_offset_y = 0;
+            }
+
+            // Rebuild cells from Neovim window content
+            try self.rebuildCellsFromNeovim(nvim);
+
+            // Update uniforms
+            const bg = nvim.default_background;
+            self.uniforms.bg_color = .{
+                @intCast((bg >> 16) & 0xFF),
+                @intCast((bg >> 8) & 0xFF),
+                @intCast(bg & 0xFF),
+                @intFromFloat(@round(self.config.background_opacity * 255.0)),
+            };
+
+            self.cells_rebuilt = true;
+            self.font_shaper.endFrame();
+        }
+
+        /// Rebuild GPU cells from Neovim window content.
+        fn rebuildCellsFromNeovim(self: *Self, nvim: *neovim_gui.NeovimGui) !void {
+            // Reset all cells
+            self.cells.reset();
+
+            // Get grid dimensions from the first window (grid 1 is usually the main editor)
+            const main_window = nvim.getWindow(1) orelse return;
+
+            // Ensure our cells buffer matches the grid size
+            const rows: u16 = @intCast(main_window.grid_height);
+            const cols: u16 = @intCast(main_window.grid_width);
+
+            if (rows == 0 or cols == 0) return;
+
+            if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
+                try self.cells.resize(self.alloc, .{ .rows = rows, .columns = cols });
+                self.uniforms.grid_size = .{ cols, rows };
+            }
+
+            // Get default colors from Neovim
+            const default_fg = nvim.default_foreground;
+            const default_bg = nvim.default_background;
+
+            // Collect windows and sort by z-index for proper layering
+            // Lower z-index windows render first, higher ones on top
+            var windows_to_render = std.ArrayList(*neovim_gui.RenderedWindow).init(self.alloc);
+            defer windows_to_render.deinit();
+
+            var window_iter = nvim.windows.valueIterator();
+            while (window_iter.next()) |window_ptr| {
+                const window = window_ptr.*;
+                if (window.hidden or !window.valid) continue;
+                if (window.grid_height == 0 or window.grid_width == 0) continue;
+                if (window.cells.len == 0) continue;
+                windows_to_render.append(window) catch continue;
+            }
+
+            // Sort by z-index (lower first, so higher z-index renders on top)
+            std.mem.sort(*neovim_gui.RenderedWindow, windows_to_render.items, {}, struct {
+                fn lessThan(_: void, a: *neovim_gui.RenderedWindow, b: *neovim_gui.RenderedWindow) bool {
+                    return a.zindex < b.zindex;
+                }
+            }.lessThan);
+
+            // Process each Neovim window in z-order
+            for (windows_to_render.items) |window| {
+                // Get window position offset
+                const win_col: u16 = @intFromFloat(window.grid_position[0]);
+                const win_row: u16 = @intFromFloat(window.grid_position[1]);
+
+                // Render each cell in the grid
+                var row: u32 = 0;
+                while (row < window.grid_height) : (row += 1) {
+                    var col: u32 = 0;
+                    while (col < window.grid_width) : (col += 1) {
+                        const grid_cell = window.getCell(row, col) orelse continue;
+
+                        // Apply window position offset
+                        const y: u16 = @intCast(row);
+                        const x: u16 = @intCast(col);
+                        const screen_y = y + win_row;
+                        const screen_x = x + win_col;
+
+                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
+
+                        // Get highlight attributes from NeovimGui
+                        const hl_attr = nvim.getHlAttr(grid_cell.hl_id);
+
+                        // Handle reverse video
+                        var fg_color = hl_attr.foreground orelse default_fg;
+                        var bg_color = hl_attr.background orelse default_bg;
+
+                        if (hl_attr.reverse) {
+                            const tmp = fg_color;
+                            fg_color = bg_color;
+                            bg_color = tmp;
+                        }
+
+                        // Set background color at screen position
+                        self.cells.bgCell(screen_y, screen_x).* = .{
+                            @intCast((bg_color >> 16) & 0xFF),
+                            @intCast((bg_color >> 8) & 0xFF),
+                            @intCast(bg_color & 0xFF),
+                            255,
+                        };
+
+                        // Render the glyph if cell has text
+                        const text = grid_cell.getText();
+                        if (text.len > 0) {
+                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr) catch {};
+                        }
+                    }
+                }
+            }
+
+            // Render cursor
+            self.renderNeovimCursor(nvim, default_fg, default_bg);
+        }
+
+        /// Render the Neovim cursor with smooth animation
+        fn renderNeovimCursor(self: *Self, nvim: *neovim_gui.NeovimGui, default_fg: u32, default_bg: u32) void {
+            _ = default_bg;
+            const cursor_row: u16 = @intCast(nvim.cursor_row);
+            const cursor_col: u16 = @intCast(nvim.cursor_col);
+
+            if (cursor_row >= self.cells.size.rows or cursor_col >= self.cells.size.columns) return;
+
+            // Set cursor position in uniforms (grid coordinates)
+            self.uniforms.cursor_pos = .{ cursor_col, cursor_row };
+
+            // CURSOR ANIMATION: Detect position change and trigger animation
+            const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+            const last_x = self.last_cursor_grid_pos[0];
+            const last_y = self.last_cursor_grid_pos[1];
+
+            if (cursor_col != last_x or cursor_row != last_y) {
+                // Cursor moved - start animation from old position to new
+                const old_pixel_x: f32 = @as(f32, @floatFromInt(last_x)) * cell_width;
+                const old_pixel_y: f32 = @as(f32, @floatFromInt(last_y)) * cell_height;
+                const new_pixel_x: f32 = @as(f32, @floatFromInt(cursor_col)) * cell_width;
+                const new_pixel_y: f32 = @as(f32, @floatFromInt(cursor_row)) * cell_height;
+
+                self.cursor_animation.current_x = old_pixel_x;
+                self.cursor_animation.current_y = old_pixel_y;
+                self.cursor_animation.setTarget(new_pixel_x, new_pixel_y, cell_width);
+
+                self.last_cursor_grid_pos = .{ cursor_col, cursor_row };
+                self.cursor_animating = true;
+            }
+
+            // Update cursor offset uniforms from animation state
+            const pos = self.cursor_animation.getPosition();
+            const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_col)) * cell_width;
+            const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_row)) * cell_height;
+            self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
+            self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
+
+            // Render cursor glyph using the proper cursor rendering system
+            // This ensures the cursor_offset_x/y uniforms are applied via IS_CURSOR_GLYPH
+            const cursor_color_rgb = terminal.color.RGB{
+                .r = @intCast((default_fg >> 16) & 0xFF),
+                .g = @intCast((default_fg >> 8) & 0xFF),
+                .b = @intCast(default_fg & 0xFF),
+            };
+
+            // Render a block cursor sprite
+            const render = self.font_grid.renderGlyph(
+                self.alloc,
+                font.sprite_index,
+                @intFromEnum(font.Sprite.cursor_rect),
+                .{
+                    .cell_width = 1,
+                    .grid_metrics = self.grid_metrics,
+                },
+            ) catch {
+                return;
+            };
+
+            // Add cursor using setCursor - this marks it with is_cursor_glyph
+            // so the shader applies cursor_offset_x/y for animation
+            self.cells.setCursor(.{
+                .atlas = .grayscale,
+                .bools = .{ .is_cursor_glyph = true },
+                .grid_pos = .{ cursor_col, cursor_row },
+                .color = .{ cursor_color_rgb.r, cursor_color_rgb.g, cursor_color_rgb.b, 255 },
+                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .glyph_size = .{ render.glyph.width, render.glyph.height },
+                .bearings = .{
+                    @intCast(render.glyph.offset_x),
+                    @intCast(render.glyph.offset_y),
+                },
+            }, .block);
+        }
+
+        /// Add a glyph from Neovim cell content
+        fn addNeovimGlyph(
+            self: *Self,
+            x: u16,
+            y: u16,
+            text: []const u8,
+            fg_color: u32,
+            hl_attr: neovim_gui.HlAttr,
+        ) !void {
+            // Decode the first codepoint from text
+            var iter = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
+            const codepoint = iter.nextCodepoint() orelse return;
+
+            // Skip spaces and null
+            if (codepoint == ' ' or codepoint == 0) return;
+
+            // Determine font style based on highlight attributes
+            const font_style: font.Style = if (hl_attr.bold and hl_attr.italic)
+                .bold_italic
+            else if (hl_attr.bold)
+                .bold
+            else if (hl_attr.italic)
+                .italic
+            else
+                .regular;
+
+            // Try to render the codepoint using the font grid
+            const render_result = self.font_grid.renderCodepoint(
+                self.alloc,
+                codepoint,
+                font_style,
+                .text,
+                .{
+                    .cell_width = 1,
+                    .grid_metrics = self.grid_metrics,
+                },
+            ) catch {
+                return;
+            };
+
+            const render = render_result orelse return;
+
+            try self.cells.add(self.alloc, .text, .{
+                .atlas = .grayscale,
+                .grid_pos = .{ x, y },
+                .color = .{
+                    @intCast((fg_color >> 16) & 0xFF),
+                    @intCast((fg_color >> 8) & 0xFF),
+                    @intCast(fg_color & 0xFF),
+                    255,
+                },
+                .glyph_pos = .{
+                    render.glyph.atlas_x,
+                    render.glyph.atlas_y,
+                },
+                .glyph_size = .{
+                    render.glyph.width,
+                    render.glyph.height,
+                },
+                .bearings = .{
+                    @intCast(render.glyph.offset_x),
+                    @intCast(render.glyph.offset_y),
+                },
+            });
+
+            // Handle underline
+            if (hl_attr.underline or hl_attr.undercurl) {
+                const underline_style: terminal.Attribute.Underline = if (hl_attr.undercurl)
+                    .curly
+                else
+                    .single;
+
+                const underline_color = terminal.color.RGB{
+                    .r = @intCast((fg_color >> 16) & 0xFF),
+                    .g = @intCast((fg_color >> 8) & 0xFF),
+                    .b = @intCast(fg_color & 0xFF),
+                };
+
+                self.addUnderline(x, y, underline_style, underline_color, 255) catch {};
+            }
+
+            // Handle strikethrough
+            if (hl_attr.strikethrough) {
+                const strike_color = terminal.color.RGB{
+                    .r = @intCast((fg_color >> 16) & 0xFF),
+                    .g = @intCast((fg_color >> 8) & 0xFF),
+                    .b = @intCast(fg_color & 0xFF),
+                };
+
+                self.addStrikethrough(x, y, strike_color, 255) catch {};
+            }
         }
 
         /// Draw the frame to the screen.

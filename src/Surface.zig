@@ -36,6 +36,7 @@ const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
+const neovim_gui = @import("neovim_gui/main.zig");
 
 const log = std.log.scoped(.surface);
 
@@ -122,6 +123,10 @@ io_thr: std.Thread,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
+
+/// Neovim GUI mode - when set, this surface acts as a Neovim GUI client
+/// instead of a terminal emulator
+nvim_gui: ?*neovim_gui.NeovimGui = null,
 
 /// All our sizing information.
 size: rendererpkg.Size,
@@ -341,6 +346,7 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    neovim_gui_socket: ?[]const u8,
 
     const Link = struct {
         regex: oni.Regex,
@@ -419,6 +425,10 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            .neovim_gui_socket = if (config.@"neovim-gui".len > 0)
+                try alloc.dupe(u8, config.@"neovim-gui")
+            else
+                null,
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -779,6 +789,13 @@ pub fn init(
 
     // We are no longer the first surface
     app.first = false;
+
+    // Initialize Neovim GUI mode if configured
+    if (derived_config.neovim_gui_socket != null) {
+        self.initNeovimGui() catch |err| {
+            log.warn("Failed to initialize Neovim GUI mode: {}", .{err});
+        };
+    }
 }
 
 pub fn deinit(self: *Surface) void {
@@ -814,6 +831,11 @@ pub fn deinit(self: *Surface) void {
         self.alloc.destroy(v);
     }
 
+    // Clean up Neovim GUI if active
+    if (self.nvim_gui) |nvim| {
+        nvim.deinit();
+    }
+
     // Clean up our keyboard state
     for (self.keyboard.sequence_queued.items) |req| req.deinit();
     self.keyboard.sequence_queued.deinit(self.alloc);
@@ -834,6 +856,72 @@ pub fn deinit(self: *Surface) void {
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
     self.rt_surface.close(self.needsConfirmQuit());
+}
+
+/// Check if this surface is in Neovim GUI mode
+pub fn isNeovimGuiMode(self: *const Surface) bool {
+    return self.nvim_gui != null;
+}
+
+/// Initialize Neovim GUI mode for this surface
+/// This should be called after Surface.init if neovim-gui config is set
+pub fn initNeovimGui(self: *Surface) !void {
+    const socket_path = self.config.neovim_gui_socket orelse return;
+
+    log.info("Initializing Neovim GUI mode with socket: {s}", .{socket_path});
+
+    const nvim = try neovim_gui.NeovimGui.init(self.alloc);
+    errdefer nvim.deinit();
+
+    // Set initial grid size based on terminal size
+    nvim.grid_width = self.size.grid().columns;
+    nvim.grid_height = self.size.grid().rows;
+    nvim.cell_width = @floatFromInt(self.size.cell.width);
+    nvim.cell_height = @floatFromInt(self.size.cell.height);
+
+    // Connect based on mode:
+    // - "embed" - spawn nvim --embed (direct pipe communication, loads user config)
+    // - "spawn" - spawn nvim --listen on temp socket then connect (best experience)
+    // - any path - connect to existing Neovim socket
+    if (std.mem.eql(u8, socket_path, "embed")) {
+        try nvim.spawn();
+    } else if (std.mem.eql(u8, socket_path, "spawn")) {
+        try nvim.spawnWithSocket();
+    } else {
+        try nvim.connect(socket_path);
+    }
+
+    self.nvim_gui = nvim;
+
+    // Set the nvim_gui pointer on the renderer state so it can render from Neovim
+    self.renderer_state.nvim_gui = nvim;
+
+    // Wire up the render wakeup for zero-latency rendering
+    // When Neovim sends a flush event, the I/O thread will directly wake up the renderer
+    const WakeupType = @TypeOf(self.renderer_thread.wakeup);
+    nvim.setRenderWakeup(
+        @ptrCast(&self.renderer_thread.wakeup),
+        struct {
+            fn notify(ptr: *anyopaque) void {
+                const wakeup: *WakeupType = @ptrCast(@alignCast(ptr));
+                wakeup.notify() catch {};
+            }
+        }.notify,
+    );
+
+    log.info("Neovim GUI mode initialized successfully", .{});
+}
+
+/// Send a key event to Neovim (when in GUI mode)
+pub fn sendKeyToNeovim(self: *Surface, event: input.KeyEvent) !void {
+    const nvim = self.nvim_gui orelse return;
+
+    // Convert the Ghostty key event to Neovim notation
+    if (neovim_gui.nvim_input.toNeovimKey(event)) |key_str| {
+        try nvim.sendKey(key_str);
+        // Queue a render to show the response from Neovim ASAP
+        try self.queueRender();
+    }
 }
 
 /// Returns a mailbox that can be used to send messages to this surface.
@@ -2464,6 +2552,18 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
             "set. Is your padding reasonable?", .{});
     }
 
+    // If in Neovim GUI mode, resize the Neovim UI
+    if (self.nvim_gui) |nvim| {
+        nvim.resize(
+            grid_size.columns,
+            grid_size.rows,
+            @floatFromInt(self.size.cell.width),
+            @floatFromInt(self.size.cell.height),
+        ) catch |err| {
+            log.warn("Failed to resize Neovim UI: {}", .{err});
+        };
+    }
+
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
 }
@@ -2658,6 +2758,13 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    // If we're in Neovim GUI mode, route all non-binding keys to Neovim
+    if (self.nvim_gui != null) {
+        try self.sendKeyToNeovim(event);
+        return .consumed;
+    }
+
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
@@ -3556,18 +3663,18 @@ pub fn scrollCallback(
             // 1. Scroll terminal viewport immediately
             // 2. Set scroll_delta_lines so renderer can animate visually
             // 3. Renderer animates from old position to new position
-            
+
             const yoff_adjusted = yoff * self.config.mouse_scroll_multiplier.precision;
-            
+
             // Check if we can scroll
             const is_main_screen = self.io.terminal.screens.active_key == .primary;
             const screen_pages = &self.io.terminal.screens.active.pages;
             const has_history = screen_pages.total_rows > screen_pages.rows;
-            
+
             if (is_main_screen and has_history) {
                 // Accumulate pixel offset (negative yoff = scroll down = positive offset)
                 self.mouse.pixel_scroll_offset -= yoff_adjusted;
-                
+
                 // Only scroll terminal when we've accumulated a full line
                 const max_scroll_rows = screen_pages.total_rows -| screen_pages.rows;
                 const current_vp_offset: f64 = switch (screen_pages.viewport) {
@@ -3578,19 +3685,19 @@ pub fn scrollCallback(
                         break :blk @floatFromInt(max_scroll_rows -| offset);
                     },
                 };
-                
+
                 // Total visual scroll in lines
                 const total_scroll_lines = current_vp_offset + (self.mouse.pixel_scroll_offset / cell_height);
-                
+
                 // Clamp visual scroll to valid range
                 if (total_scroll_lines < 0) {
                     // Hit bottom - clamp offset
                     self.mouse.pixel_scroll_offset = -current_vp_offset * cell_height;
                 } else if (total_scroll_lines > @as(f64, @floatFromInt(max_scroll_rows))) {
-                    // Hit top - clamp offset  
+                    // Hit top - clamp offset
                     self.mouse.pixel_scroll_offset = (@as(f64, @floatFromInt(max_scroll_rows)) - current_vp_offset) * cell_height;
                 }
-                
+
                 // Scroll terminal viewport to keep content loaded
                 // Scroll when offset crosses line boundaries
                 // Keep offset in range [0, cell_height) for upward scroll (into history)
@@ -3603,7 +3710,7 @@ pub fn scrollCallback(
                     self.mouse.pixel_scroll_offset += cell_height;
                     try self.io.terminal.scrollViewport(.{ .delta = 1 });
                 }
-                
+
                 // Update renderer state
                 self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
             } else {

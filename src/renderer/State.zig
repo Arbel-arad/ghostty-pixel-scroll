@@ -7,6 +7,7 @@ const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const animation = @import("../animation.zig");
+const neovim_gui = @import("../neovim_gui/main.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -20,6 +21,10 @@ terminal: *terminalpkg.Terminal,
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,
+
+/// Neovim GUI mode state. When set, the renderer should read cell content
+/// from NeovimGui windows instead of the terminal.
+nvim_gui: ?*neovim_gui.NeovimGui = null,
 
 /// Dead key state. This will render the current dead key preedit text
 /// over the cursor. This currently only ever renders a single codepoint.
@@ -46,7 +51,7 @@ pub const Mouse = struct {
     /// offset in pixels (0 to cell_height). Positive values scroll the
     /// content up (user scrolled down into history).
     pixel_scroll_offset_y: f32 = 0,
-    
+
     /// Scroll animation delta in lines. When terminal viewport scrolls by N lines,
     /// this is set to N so the renderer can animate from old to new position.
     /// Positive = scrolled down into history (content moves up).

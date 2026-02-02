@@ -931,18 +931,38 @@ palette: Palette = .{},
 /// running inside the terminal (for example full-screen TUIs) that handle
 /// scrolling themselves.
 @"pixel-scroll": bool = true,
-    
-    /// The duration of the cursor animation in seconds.
-    @"cursor-animation-duration": f32 = 0.1,
-    
-    /// The bounciness of the cursor animation (0.0 to 1.0).
-    @"cursor-animation-bounciness": f32 = 0.0,
-    
-    /// The duration of the scroll animation in seconds.
-    @"scroll-animation-duration": f32 = 0.2,
-    
-    /// The bounciness of the scroll animation (0.0 to 1.0).
-    @"scroll-animation-bounciness": f32 = 0.0,
+
+/// The duration of the cursor animation in seconds.
+@"cursor-animation-duration": f32 = 0.1,
+
+/// The bounciness of the cursor animation (0.0 to 1.0).
+@"cursor-animation-bounciness": f32 = 0.0,
+
+/// The duration of the scroll animation in seconds.
+@"scroll-animation-duration": f32 = 0.2,
+
+/// The bounciness of the scroll animation (0.0 to 1.0).
+@"scroll-animation-bounciness": f32 = 0.0,
+
+/// Enable Neovim GUI mode. When enabled, Ghostty acts as a native Neovim GUI
+/// client (like Neovide) instead of a terminal emulator. This provides:
+///
+///   * Perfect smooth scrolling with per-window scrollback buffers
+///   * Proper window clipping for floating windows and splits
+///   * Cursor animations
+///   * All the features of Neovide, built into your terminal
+///
+/// Options:
+///   * "spawn" (recommended) - Spawn a new Neovim instance with a socket and connect.
+///     This loads your full user config (init.lua) and provides the best experience.
+///   * "embed" - Spawn Neovim with --embed (direct pipe communication).
+///     Also loads user config but uses pipes instead of sockets.
+///   * Socket path - Connect to an existing Neovim instance. Example:
+///     Start Neovim with: nvim --listen /tmp/nvim.sock
+///     Then set: neovim-gui = /tmp/nvim.sock
+///
+/// When not set (empty string), Ghostty runs in normal terminal mode.
+@"neovim-gui": []const u8 = "",
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
