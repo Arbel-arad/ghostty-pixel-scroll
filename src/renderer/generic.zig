@@ -1473,52 +1473,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Update frame for Neovim GUI mode.
         /// This is a separate code path that reads from Neovim windows instead of terminal state.
+        /// Neovide order (from application.rs):
+        /// 1. Events arrive → handle_draw_commands() → flush()
+        /// 2. prepare_and_animate() → animate()
+        /// 3. redraw_requested() → render()
         fn updateFrameNeovim(self: *Self, nvim: *neovim_gui.NeovimGui) !void {
-            // Process any pending Neovim events - this is the hot path
-            // Called immediately when mailbox is triggered for lowest latency
-            nvim.processEvents() catch {};
-
             // Calculate time delta for smooth scroll animation
             const now = std.time.Instant.now() catch {
                 self.last_frame_time = null;
                 return;
             };
             const dt: f32 = if (self.last_frame_time) |last| blk: {
-                // Safety: Check if time went backwards (can happen with system clock adjustments)
-                // In that case, reset and use default dt to avoid integer overflow in since()
                 if (now.order(last) == .lt) {
                     break :blk 1.0 / 60.0;
                 }
                 const ns: f32 = @floatFromInt(now.since(last));
-                break :blk @min(ns / std.time.ns_per_s, 0.1); // Cap at 100ms
-            } else 1.0 / 60.0; // Default to 60fps
+                break :blk @min(ns / std.time.ns_per_s, 0.1);
+            } else 1.0 / 60.0;
             self.last_frame_time = now;
 
-            // Update scroll animations for all windows - NEOVIDE STYLE
+            // Step 1: Process events FIRST (includes flush which updates scrollback and position)
+            nvim.processEvents() catch {};
+
+            // Step 2: Animate (decay position toward 0)
             var any_animating = false;
-            var window_iter = nvim.windows.valueIterator();
-            while (window_iter.next()) |window_ptr| {
-                if (window_ptr.*.animate(dt)) {
-                    any_animating = true;
+            {
+                var window_iter = nvim.windows.valueIterator();
+                while (window_iter.next()) |window_ptr| {
+                    if (window_ptr.*.animate(dt)) {
+                        any_animating = true;
+                    }
                 }
             }
-
-            // Keep rendering while animating for smooth scrolling
             self.scroll_animating = any_animating;
 
+            // Step 3: Render with current position and updated scrollback
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
-            // NEOVIM GUI MODE: Per-window smooth scrolling
-            // The global pixel_scroll_offset_y is disabled since we use per-cell offsets.
-            // Each cell has its own pixel_offset_y field that gets the window's scroll
-            // animation position applied in rebuildCellsFromNeovim().
             self.uniforms.pixel_scroll_offset_y = 0;
 
-            // Rebuild cells from Neovim window content
             try self.rebuildCellsFromNeovim(nvim);
 
-            // Update uniforms
             const bg = nvim.default_background;
             self.uniforms.bg_color = .{
                 @intCast((bg >> 16) & 0xFF),
@@ -1628,31 +1624,58 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
 
-                // Render each cell in the grid
-                // For scrollable rows during animation, read from scrollback buffer
-                // For margin rows (winbar, statusline), read from actual_lines
-                var row: u32 = 0;
-                while (row < window.grid_height) : (row += 1) {
-                    const is_scrollable_row = window.isRowScrollable(row);
+                // Render cells - like Neovide, iterate inner_size+1 for scrollable region
+                // This allows showing partial lines at top/bottom during scroll animation
+                const margin_top = window.viewport_margins.top;
+                const margin_bottom = window.viewport_margins.bottom;
+                const inner_size = window.grid_height -| margin_top -| margin_bottom;
 
+                // Render top margin rows (winbar etc) - no scroll
+                var row: u32 = 0;
+                while (row < margin_top) : (row += 1) {
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
-                        // Get cell from appropriate source:
-                        // - Scrollable rows during animation: read from scrollback
-                        // - Margin rows or no animation: read from actual_lines
-                        const grid_cell: ?*const neovim_gui.GridCell = if (is_scrollable_row and !is_floating)
-                            window.getScrollbackCell(row, col) orelse window.getCell(row, col)
+                        const grid_cell = window.getCell(row, col);
+                        if (grid_cell == null) continue;
+                        const cell = grid_cell.?;
+                        const screen_y = @as(u16, @intCast(row)) + win_row;
+                        const screen_x = @as(u16, @intCast(col)) + win_col;
+                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
+                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(cell.hl_id) else nvim.getHlAttr(cell.hl_id);
+                        var fg_color = hl_attr.foreground orelse default_fg;
+                        var bg_color = hl_attr.background orelse default_bg;
+                        if (hl_attr.reverse) {
+                            const tmp = fg_color;
+                            fg_color = bg_color;
+                            bg_color = tmp;
+                        }
+                        self.cells.bgCell(screen_y, screen_x).* = .{
+                            @intCast((bg_color >> 16) & 0xFF), @intCast((bg_color >> 8) & 0xFF), @intCast(bg_color & 0xFF), 255,
+                        };
+                        const text = cell.getText();
+                        if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+                    }
+                }
+
+                // Render scrollable region
+                // Iterate 0..inner_size (the extra +1 row is handled by scrollback containing 2x size)
+                var inner_row: u32 = 0;
+                while (inner_row < inner_size) : (inner_row += 1) {
+                    var col: u32 = 0;
+                    while (col < window.grid_width) : (col += 1) {
+                        // Read from scrollback using inner row index
+                        const grid_cell = if (!is_floating)
+                            window.getScrollbackCellByInnerRow(inner_row, col)
                         else
-                            window.getCell(row, col);
+                            window.getCell(margin_top + inner_row, col);
 
                         if (grid_cell == null) continue;
                         const cell = grid_cell.?;
 
-                        // Apply window position offset
-                        const y: u16 = @intCast(row);
-                        const x: u16 = @intCast(col);
-                        const screen_y = y + win_row;
-                        const screen_x = x + win_col;
+                        // Screen position: margin_top + inner_row
+                        const screen_row = margin_top + inner_row;
+                        const screen_y = @as(u16, @intCast(screen_row)) + win_row;
+                        const screen_x = @as(u16, @intCast(col)) + win_col;
 
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
@@ -1724,13 +1747,36 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Render the glyph if cell has text
                         const text = cell.getText();
                         if (text.len > 0) {
-                            // Apply scroll offset only to scrollable rows (not margins like statusline/winbar)
-                            const row_scroll_offset: f32 = if (is_scrollable_row)
-                                scroll_pixel_offset
-                            else
-                                0;
-                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, row_scroll_offset) catch {};
+                            // Scrollable rows get the scroll pixel offset
+                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
                         }
+                    }
+                }
+
+                // Render bottom margin rows (statusline etc) - no scroll
+                row = window.grid_height -| margin_bottom;
+                while (row < window.grid_height) : (row += 1) {
+                    var col: u32 = 0;
+                    while (col < window.grid_width) : (col += 1) {
+                        const grid_cell = window.getCell(row, col);
+                        if (grid_cell == null) continue;
+                        const cell = grid_cell.?;
+                        const screen_y = @as(u16, @intCast(row)) + win_row;
+                        const screen_x = @as(u16, @intCast(col)) + win_col;
+                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
+                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(cell.hl_id) else nvim.getHlAttr(cell.hl_id);
+                        var fg_color = hl_attr.foreground orelse default_fg;
+                        var bg_color = hl_attr.background orelse default_bg;
+                        if (hl_attr.reverse) {
+                            const tmp = fg_color;
+                            fg_color = bg_color;
+                            bg_color = tmp;
+                        }
+                        self.cells.bgCell(screen_y, screen_x).* = .{
+                            @intCast((bg_color >> 16) & 0xFF), @intCast((bg_color >> 8) & 0xFF), @intCast(bg_color & 0xFF), 255,
+                        };
+                        const text = cell.getText();
+                        if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
                     }
                 }
             }

@@ -1203,12 +1203,11 @@ pub const IoThread = struct {
                 }
             }
         } else if (std.mem.eql(u8, name, "win_viewport")) {
-            log.info("win_viewport: args.len={}", .{args.len});
             if (args.len >= 8) {
                 const scroll_delta = extractI64(args[7]) orelse 0;
                 const grid = extractU64(args[0]) orelse return;
                 if (scroll_delta != 0) {
-                    log.info("win_viewport: grid={} scroll_delta={}", .{ grid, scroll_delta });
+                    log.debug("win_viewport: grid={} scroll_delta={}", .{ grid, scroll_delta });
                 }
                 // Note: args[1] is 'win' which is an ext type (window handle), not a u64
                 // We don't need it for scroll animation, so just skip it

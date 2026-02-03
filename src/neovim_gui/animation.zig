@@ -52,8 +52,12 @@ pub const CriticallyDampedSpring = struct {
         self.velocity = c * (-a * omega - b * dt * omega + b);
 
         // Check if we've effectively reached the destination
-        if (@abs(self.position) < 0.001) {
-            self.reset();
+        // Use 0.01 like Neovide (not 0.001)
+        // NOTE: Don't reset to 0 here! Just stop animating and let the small residual
+        // value remain. This prevents visual jumps when new scroll events arrive.
+        if (@abs(self.position) < 0.01) {
+            // Don't reset - just indicate we're done animating
+            // The position will be overwritten by the next scroll event anyway
             return false;
         }
 

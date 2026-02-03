@@ -592,6 +592,12 @@ pub const RenderedWindow = struct {
         var scrollback = &self.scrollback_lines.?;
         const actual = &self.actual_lines.?;
 
+        log.debug("flush: scroll_delta={}, scrollback_idx={}, actual_idx={}", .{
+            self.scroll_delta,
+            scrollback.current_index,
+            actual.current_index,
+        });
+
         // Get inner (scrollable) region bounds
         const inner_top: isize = @intCast(self.viewport_margins.top);
         const inner_bottom: isize = @intCast(self.grid_height -| self.viewport_margins.bottom);
@@ -603,6 +609,9 @@ pub const RenderedWindow = struct {
         const expected_scrollback_size: usize = @intCast(inner_size * 2);
         if (scrollback.length() != expected_scrollback_size) {
             // Resize scrollback - this resets the animation
+            log.err("!!! SCROLLBACK RESIZE grid={}: old_size={} new_size={} inner_size={} pos_before={d:.2}", .{
+                self.id, scrollback.length(), expected_scrollback_size, inner_size, self.scroll_animation.position,
+            });
             scrollback.deinit();
             self.scrollback_lines = RingBuffer(?*GridLine).init(self.alloc, expected_scrollback_size) catch return;
             scrollback = &self.scrollback_lines.?;
@@ -625,17 +634,45 @@ pub const RenderedWindow = struct {
 
         const scroll_delta = self.scroll_delta;
 
+        // Debug: show actual_lines content at flush time
         if (scroll_delta != 0) {
-            log.info("flush: grid={} scroll_delta={} inner_size={} position_before={d:.2}", .{
+            // Check first cell of first and last inner row
+            const first_row = actual.getConst(inner_top);
+            const last_row = actual.getConst(inner_bottom - 1);
+            const first_char: u8 = if (first_row) |r| (if (r.cells.len > 0) r.cells[0].text[0] else 0) else 0;
+            const last_char: u8 = if (last_row) |r| (if (r.cells.len > 0) r.cells[0].text[0] else 0) else 0;
+            log.err("FLUSH grid={}: delta={}, pos={d:.2}, actual[{}] first='{c}', actual[{}] last='{c}'", .{
                 self.id,
                 scroll_delta,
-                inner_size,
                 self.scroll_animation.position,
+                inner_top,
+                first_char,
+                inner_bottom - 1,
+                last_char,
             });
         }
 
         // Rotate scrollback by scroll_delta
         scrollback.rotate(scroll_delta);
+
+        // Debug: Check what's at scrollback[-1] BEFORE copy (this is what we'll read during animation)
+        if (scroll_delta > 0) {
+            const check_idx: isize = -1;
+            const check_line = scrollback.getConst(check_idx);
+            if (check_line) |line| {
+                // Check if line has content
+                const has_content = if (line.cells.len > 0)
+                    (line.cells[0].text[0] != 0)
+                else
+                    false;
+                log.debug("flush pre-copy: scrollback[-1] exists, has_content={}, cells_len={}", .{
+                    has_content,
+                    line.cells.len,
+                });
+            } else {
+                log.debug("flush pre-copy: scrollback[-1] is NULL!", .{});
+            }
+        }
 
         // Copy inner view from actual_lines into scrollback at position 0..inner_size
         var i: isize = 0;
@@ -653,22 +690,23 @@ pub const RenderedWindow = struct {
             }
         }
 
-        // Update scroll animation
+        // Update scroll animation (Neovide-style)
         if (scroll_delta != 0) {
             var scroll_offset = self.scroll_animation.position;
 
-            // Max visual offset - limit to a reasonable number of lines for smooth animation
-            // Even with a large scrollback, we don't want huge visual offsets
-            const max_visual_lines: f32 = 5.0;
+            const max_delta: f32 = @floatFromInt(inner_size);
 
-            // Accumulate the scroll delta
             scroll_offset -= @as(f32, @floatFromInt(scroll_delta));
-
-            // Clamp to max visual offset - this prevents runaway accumulation
-            scroll_offset = std.math.clamp(scroll_offset, -max_visual_lines, max_visual_lines);
+            scroll_offset = std.math.clamp(scroll_offset, -max_delta, max_delta);
 
             self.scroll_animation.position = scroll_offset;
-            log.info("flush: grid={} position_after={d:.2}", .{ self.id, scroll_offset });
+
+            log.debug("flush: scroll_delta={}, new_pos={d:.2}, current_index={}, inner_size={}", .{
+                scroll_delta,
+                self.scroll_animation.position,
+                scrollback.current_index,
+                inner_size,
+            });
         }
 
         self.scroll_delta = 0;
@@ -729,9 +767,46 @@ pub const RenderedWindow = struct {
         const scrollback_row: isize = scroll_offset_lines + inner_row;
 
         // Get the line from scrollback
-        const line = self.scrollback_lines.?.getConst(scrollback_row) orelse return null;
+        const scrollback = &self.scrollback_lines.?;
+        const line = scrollback.getConst(scrollback_row) orelse {
+            // Debug: log when we get null from scrollback
+            if (col == 0) { // Only log once per row
+                log.warn("scrollback NULL: row={}, inner_row={}, scroll_offset={}, scrollback_row={}, current_index={}, buffer_len={}", .{
+                    row,
+                    inner_row,
+                    scroll_offset_lines,
+                    scrollback_row,
+                    scrollback.current_index,
+                    scrollback.length(),
+                });
+            }
+            return null;
+        };
 
         // Get the cell
+        if (col >= line.cells.len) return null;
+        return &line.cells[col];
+    }
+
+    /// Get scrollback cell by inner row index (0-based from top of scrollable region)
+    /// Like Neovide's iter_scrollable_lines which iterates 0..inner_size+1
+    /// This allows reading one extra row at the edge during animation
+    pub fn getScrollbackCellByInnerRow(self: *const Self, inner_row: u32, col: u32) ?*const GridCell {
+        if (self.scrollback_lines == null) return null;
+        if (col >= self.grid_width) return null;
+
+        const scroll_offset_lines: isize = @intFromFloat(@floor(self.scroll_animation.position));
+        const scrollback_idx: isize = scroll_offset_lines + @as(isize, @intCast(inner_row));
+
+        const scrollback = &self.scrollback_lines.?;
+        const line = scrollback.getConst(scrollback_idx) orelse {
+            if (col == 0) {
+                log.warn("getScrollbackCellByInnerRow NULL: inner_row={}, pos={d:.3}, floor={}, idx={}", .{
+                    inner_row, self.scroll_animation.position, scroll_offset_lines, scrollback_idx,
+                });
+            }
+            return null;
+        };
         if (col >= line.cells.len) return null;
         return &line.cells[col];
     }
