@@ -408,13 +408,6 @@ pub const RenderState = struct {
         self.scroll_jump += @floatFromInt(tracker_diff);
         self.last_scroll_tracker = s.scroll_tracker;
 
-        // TUI scroll delta from Neovim OSC 9999
-        //
-        // NOTE: The tui_scroll_delta is now consumed by the renderer (generic.zig)
-        // for frame-capture scroll animation. Don't consume it here!
-        // The renderer reads it after calling terminal_state.update() and
-        // clears it after reading.
-
         self.viewport_pin = viewport_pin;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;

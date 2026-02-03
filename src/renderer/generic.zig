@@ -22,7 +22,6 @@ const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
 const animation = @import("../animation.zig");
-const tui_scroll = @import("tui_scroll.zig");
 const neovim_gui = @import("../neovim_gui/main.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
@@ -220,33 +219,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Accumulated scroll offset in pixels (for sub-line input)
         scroll_pixel_offset: f32 = 0,
 
-        /// Shared scroll animation state for TUI smooth scrolling (frame capture approach).
-        /// This must be shared across all swap chain frames to maintain prev/curr frame consistency.
-        /// When pixel_scroll is enabled, this holds the prev_frame and curr_frame textures.
-        /// DEPRECATED: Use tui_scrollback for the proper Neovide-style approach.
-        shared_scroll_state: ?ScrollAnimationState = null,
-
-        /// TUI scrollback for Neovide-style per-line ring buffer scrolling.
-        /// This replaces the texture-blending approach which doesn't work due to
-        /// content already being updated by the time we capture frames.
-        tui_scrollback: ?tui_scroll.TuiScrollback = null,
-
-        /// TUI scroll delta from OSC 9999 (lines to animate)
-        /// This is set in updateFrame and consumed in drawFrame to trigger
-        /// frame-capture scroll animation.
-        tui_scroll_delta: i32 = 0,
-
-        /// TUI scroll region from OSC 9999 (top/bottom rows of scrollable area)
-        /// Rows outside this region (status bar, cmdline) should not scroll.
-        tui_scroll_top: u32 = 0,
-        tui_scroll_bot: u32 = 0,
-        tui_scroll_left: u32 = 0,
-        tui_scroll_right: u32 = 0,
-        tui_scroll_active: bool = false,
         /// Whether we're currently in the alternate screen (TUI apps like Neovim).
-        /// This is tracked separately from tui_scroll_active because we need to
-        /// disable terminal scrollback offset as soon as we enter alternate screen,
-        /// not just when OSC 9999 is received.
         in_alternate_screen: bool = false,
 
         /// This value is used to force-update swap chain targets in the
@@ -584,161 +557,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         };
 
-        /// State for scroll animation with frame blending (for smooth TUI scrolling).
-        ///
-        /// This is used when pixel-scroll is enabled and a TUI application
-        /// (like Neovim) sends scroll hints via OSC 9999. Instead of just
-        /// shifting all content by a pixel offset (which causes edge bounce),
-        /// we capture the previous frame and blend it with the new frame
-        /// during scroll animation.
-        const ScrollAnimationState = struct {
-            /// The previous frame texture - captured before scroll starts
-            prev_frame: Texture,
-            /// The current frame texture - rendered after terminal redraws
-            curr_frame: Texture,
-            /// Sampler for texture access in the blend shader
-            sampler: Sampler,
-            /// Uniforms for the scroll blend shader
-            uniforms: UniformBuffer,
-
-            /// Whether a scroll animation is currently active
-            is_animating: bool = false,
-            /// The scroll delta in pixels (from OSC 9999, converted)
-            scroll_delta_pixels: f32 = 0,
-            /// Spring animation for smooth critically-damped motion (like Neovide)
-            spring: animation.Spring = .{},
-
-            const UniformBuffer = Buffer(shaderpkg.ScrollBlendUniforms);
-
-            pub fn init(api: GraphicsAPI) !ScrollAnimationState {
-                // Create a GPU buffer for scroll blend uniforms
-                var uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
-                errdefer uniforms.deinit();
-
-                // Initialize textures at 1x1 px (will be resized)
-                const prev_frame = try Texture.init(
-                    api.textureOptions(),
-                    1,
-                    1,
-                    null,
-                );
-                errdefer prev_frame.deinit();
-                const curr_frame = try Texture.init(
-                    api.textureOptions(),
-                    1,
-                    1,
-                    null,
-                );
-                errdefer curr_frame.deinit();
-
-                const sampler = try Sampler.init(api.samplerOptions());
-                errdefer sampler.deinit();
-
-                return .{
-                    .prev_frame = prev_frame,
-                    .curr_frame = curr_frame,
-                    .sampler = sampler,
-                    .uniforms = uniforms,
-                };
-            }
-
-            pub fn deinit(self: *ScrollAnimationState) void {
-                self.prev_frame.deinit();
-                self.curr_frame.deinit();
-                self.sampler.deinit();
-                self.uniforms.deinit();
-            }
-
-            pub fn resize(
-                self: *ScrollAnimationState,
-                api: GraphicsAPI,
-                width: usize,
-                height: usize,
-            ) !void {
-                const prev_frame = try Texture.init(
-                    api.textureOptions(),
-                    @intCast(width),
-                    @intCast(height),
-                    null,
-                );
-                errdefer prev_frame.deinit();
-                const curr_frame = try Texture.init(
-                    api.textureOptions(),
-                    @intCast(width),
-                    @intCast(height),
-                    null,
-                );
-                errdefer curr_frame.deinit();
-
-                self.prev_frame.deinit();
-                self.curr_frame.deinit();
-
-                self.prev_frame = prev_frame;
-                self.curr_frame = curr_frame;
-            }
-
-            /// Swap previous and current frame textures.
-            /// Call this before rendering a new frame to "capture" the old frame.
-            pub fn captureFrame(self: *ScrollAnimationState) void {
-                std.mem.swap(Texture, &self.prev_frame, &self.curr_frame);
-            }
-
-            /// Start a scroll animation with the given line delta.
-            pub fn startAnimation(self: *ScrollAnimationState, delta_lines: i32, cell_height: f32) void {
-                // Convert lines to pixels
-                const delta_pixels = @as(f32, @floatFromInt(delta_lines)) * cell_height;
-
-                // If already animating, accumulate the delta to avoid jumping
-                // This handles rapid scrolling smoothly
-                if (self.is_animating) {
-                    self.spring.position += delta_pixels;
-                } else {
-                    self.spring.position = delta_pixels;
-                    self.spring.velocity = 0;
-                }
-
-                // Update total delta for blend factor calculation (resets progress to 0)
-                self.scroll_delta_pixels = self.spring.position;
-                self.is_animating = true;
-
-                // NOTE: We do NOT call captureFrame() here.
-                // We rely on the end-of-frame captureFrame() to ensure prev_frame is always
-                // the last rendered frame. This prevents swapping in garbage/new frame too early.
-            }
-
-            /// Update the spring animation.
-            /// Returns true if still animating.
-            pub fn updateSpring(self: *ScrollAnimationState, dt: f32, animation_length: f32) bool {
-                // Use critically damped spring (zeta = 1.0) like Neovide
-                const still_animating = self.spring.update(dt, animation_length, 1.0);
-                if (!still_animating) {
-                    self.is_animating = false;
-                }
-                return still_animating;
-            }
-
-            /// Get current scroll offset in pixels (for blending)
-            pub fn getScrollOffset(self: *const ScrollAnimationState) f32 {
-                return self.spring.position;
-            }
-
-            /// Get blend factor (1.0 when at rest, 0.0 at start of animation)
-            pub fn getBlendFactor(self: *const ScrollAnimationState) f32 {
-                if (self.scroll_delta_pixels == 0) return 1.0;
-                // blend = 1 - (current_offset / total_scroll)
-                // At start: offset = total, blend = 0 (show prev frame)
-                // At end: offset = 0, blend = 1 (show curr frame)
-                return 1.0 - @abs(self.spring.position / self.scroll_delta_pixels);
-            }
-
-            /// Reset animation state (called when animation completes).
-            pub fn resetAnimation(self: *ScrollAnimationState) void {
-                self.is_animating = false;
-                self.scroll_delta_pixels = 0;
-                self.spring.reset();
-            }
-        };
-
         /// The configuration for this renderer that is derived from the main
         /// configuration. This must be exported so that we don't need to
         /// pass around Config pointers which makes memory management a pain.
@@ -1014,8 +832,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
-            if (self.shared_scroll_state) |*state| state.deinit();
-            if (self.tui_scrollback) |*scrollback| scrollback.deinit();
             self.swap_chain.deinit();
 
             if (DisplayLink != void) {
@@ -1385,12 +1201,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
-                tui_scroll_delta: i32,
-                tui_scroll_top: u32,
-                tui_scroll_bot: u32,
-                tui_scroll_left: u32,
-                tui_scroll_right: u32,
-                tui_scroll_active: bool,
                 tui_in_alternate: bool,
             };
 
@@ -1484,18 +1294,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Reset scroll delta (we're consuming it)
                 state.mouse.scroll_delta_lines = 0;
 
-                // Get TUI scroll delta and region from OSC 9999 (from Neovim, etc.)
-                // and reset the delta (we're consuming it)
-                const tui_delta = state.terminal.tui_scroll_delta;
-                const tui_top = state.terminal.tui_scroll_top;
-                const tui_bot = state.terminal.tui_scroll_bot;
-                const tui_left = state.terminal.tui_scroll_left;
-                const tui_right = state.terminal.tui_scroll_right;
-                const tui_active = state.terminal.tui_scroll_active;
                 const tui_in_alternate = state.terminal.screens.active_key == .alternate;
-                if (tui_delta != 0) {
-                    @as(*Terminal, @constCast(state.terminal)).tui_scroll_delta = 0;
-                }
 
                 break :critical .{
                     .links = links,
@@ -1503,12 +1302,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
-                    .tui_scroll_delta = tui_delta,
-                    .tui_scroll_top = tui_top,
-                    .tui_scroll_bot = tui_bot,
-                    .tui_scroll_left = tui_left,
-                    .tui_scroll_right = tui_right,
-                    .tui_scroll_active = tui_active,
                     .tui_in_alternate = tui_in_alternate,
                 };
             };
@@ -1636,43 +1429,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Store the sub-line pixel offset
                 self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
 
-                // Store TUI scroll delta and region for animation in drawFrame
-                // This comes from Neovim/TUI apps via OSC 9999
-                if (critical.tui_scroll_delta != 0 and self.config.pixel_scroll) {
-                    self.tui_scroll_delta = critical.tui_scroll_delta;
-                    self.tui_scroll_top = critical.tui_scroll_top;
-                    self.tui_scroll_bot = critical.tui_scroll_bot;
-                    self.tui_scroll_left = critical.tui_scroll_left;
-                    self.tui_scroll_right = critical.tui_scroll_right;
-
-                    // If the scroll region reaches the last row and we have a top margin,
-                    // keep the bottom line fixed (prevents statusline from sliding).
-                    if (self.tui_scroll_bot == self.cells.size.rows and self.tui_scroll_top > 0 and self.tui_scroll_bot > 0) {
-                        self.tui_scroll_bot -= 1;
-                    }
-                }
                 // Track alternate screen state - this determines whether to apply
                 // terminal scrollback offset (alternate screen = no scrollback = no offset)
                 self.in_alternate_screen = critical.tui_in_alternate;
-
-                if (critical.tui_scroll_active and critical.tui_in_alternate) {
-                    self.tui_scroll_active = true;
-                } else if (!critical.tui_in_alternate) {
-                    self.tui_scroll_active = false;
-                    self.tui_scroll_delta = 0;
-                    if (self.tui_scrollback) |*scrollback| {
-                        scrollback.is_animating = false;
-                        scrollback.scroll_animation.reset();
-                        scrollback.pending_scroll_delta = 0;
-                    }
-                }
-
-                // Update scroll region uniforms for shaders
-                // This tells the GPU which rows should scroll vs stay fixed
-                self.uniforms.scroll_region_top = self.tui_scroll_top;
-                self.uniforms.scroll_region_bot = self.tui_scroll_bot;
-                self.uniforms.scroll_region_left = self.tui_scroll_left;
-                self.uniforms.scroll_region_right = self.tui_scroll_right;
 
                 // Update our background color
                 self.uniforms.bg_color = .{
@@ -1724,6 +1483,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             };
             const dt: f32 = if (self.last_frame_time) |last| blk: {
+                // Safety: Check if time went backwards (can happen with system clock adjustments)
+                // In that case, reset and use default dt to avoid integer overflow in since()
+                if (now.order(last) == .lt) {
+                    break :blk 1.0 / 60.0;
+                }
                 const ns: f32 = @floatFromInt(now.since(last));
                 break :blk @min(ns / std.time.ns_per_s, 0.1); // Cap at 100ms
             } else 1.0 / 60.0; // Default to 60fps
@@ -1738,48 +1502,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Update Neovide-style cursor renderer (4-corner trail animation)
-            if (nvim.cursor_renderer.update(dt)) {
-                any_animating = true;
-            }
-
-            // Also update legacy cursor animation for compatibility
-            if (self.cursor_animating) {
-                const cursor_len = self.config.cursor_animation_duration;
-                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
-                self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
-                if (self.cursor_animating) {
-                    any_animating = true;
-                }
-            }
-
-            // Keep rendering while animating for smooth 60fps+ scrolling/cursor
-            self.scroll_animating = any_animating or self.cursor_animating or nvim.cursor_renderer.animating;
+            // Keep rendering while animating for smooth scrolling
+            self.scroll_animating = any_animating;
 
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
-            // Get cell height for pixel offset calculation
-            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
-
-            // NEOVIM GUI MODE: No extra row to hide
-            // Terminal mode shifts content UP by cell_height to hide an extra row used for
-            // smooth scrollback, but in Neovim GUI mode we don't have that extra row.
-            // Setting to 0 means content renders at its natural grid position.
+            // NEOVIM GUI MODE: Scroll animation
+            // TODO: Implement proper Neovide-style scrollback buffer rendering
+            // For now, we disable scroll offset because without a scrollback buffer,
+            // the text shifts but backgrounds don't, causing visual artifacts.
+            // The animation system is in place but we need scrollback rendering to use it.
             self.uniforms.pixel_scroll_offset_y = 0;
-
-            // NEOVIDE-STYLE SMOOTH SCROLLING:
-            // The scroll_animation.position represents how many lines we're "behind"
-            // Multiply by cell height to get pixel offset
-            if (nvim.getWindow(1)) |main_window| {
-                // Position is in lines, convert to pixels
-                // Negative position = content should move UP (we scrolled down, showing new content below)
-                // So we ADD the offset to shift content up
-                const scroll_pixels = main_window.scroll_animation.position * cell_height;
-                self.uniforms.tui_scroll_offset_y = scroll_pixels;
-            } else {
-                self.uniforms.tui_scroll_offset_y = 0;
-            }
 
             // Rebuild cells from Neovim window content
             try self.rebuildCellsFromNeovim(nvim);
@@ -1856,6 +1590,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const win_col: u16 = @intFromFloat(window.grid_position[0]);
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
 
+                // Debug: log window positions
+                if (window.dirty) {
+                    log.debug("RENDER window {}: pos=({},{}) size={}x{} zindex={}", .{
+                        window.id,
+                        win_col,
+                        win_row,
+                        window.grid_width,
+                        window.grid_height,
+                        window.zindex,
+                    });
+                }
+
                 // Render each cell in the grid
                 var row: u32 = 0;
                 while (row < window.grid_height) : (row += 1) {
@@ -1885,6 +1631,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
 
                         // Set background color at screen position
+                        // DEBUG: Check if we have a non-default bg
+                        const is_special_bg = bg_color != default_bg;
+                        if (is_special_bg and screen_y < 5) {
+                            log.err("BG: cell({},{}) hl_id={} bg=0x{x:0>6}", .{ screen_x, screen_y, grid_cell.hl_id, bg_color });
+                        }
                         self.cells.bgCell(screen_y, screen_x).* = .{
                             @intCast((bg_color >> 16) & 0xFF),
                             @intCast((bg_color >> 8) & 0xFF),
@@ -1905,30 +1656,55 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.renderNeovimCursor(nvim, default_fg, default_bg);
         }
 
-        /// Render the Neovim cursor with Neovide-style trail animation
+        /// Render the Neovim cursor using Ghostty's cursor animation system
         fn renderNeovimCursor(self: *Self, nvim: *neovim_gui.NeovimGui, default_fg: u32, default_bg: u32) void {
             _ = default_bg;
-            const cursor_row: u16 = @intCast(nvim.cursor_row);
-            const cursor_col: u16 = @intCast(nvim.cursor_col);
 
-            if (cursor_row >= self.cells.size.rows or cursor_col >= self.cells.size.columns) return;
+            // Get the cursor's window to find screen position
+            const cursor_window = nvim.windows.get(nvim.cursor_grid) orelse return;
+            if (!cursor_window.valid or cursor_window.hidden) return;
 
-            // Set cursor position in uniforms (grid coordinates)
-            self.uniforms.cursor_pos = .{ cursor_col, cursor_row };
+            // Calculate screen position
+            const local_col_f: f32 = @floatFromInt(nvim.cursor_col);
+            const local_row_f: f32 = @floatFromInt(nvim.cursor_row);
+            const grid_x = local_col_f + cursor_window.grid_position[0];
+            var grid_y = local_row_f + cursor_window.grid_position[1];
+            grid_y -= cursor_window.scroll_animation.position;
 
-            // Get cursor offset from the Neovide-style cursor renderer
-            const cursor_renderer = &nvim.cursor_renderer;
-            const offset = cursor_renderer.getCursorOffset();
+            const top_border: f32 = @floatFromInt(cursor_window.viewport_margins.top);
+            const bottom_border: f32 = @floatFromInt(cursor_window.viewport_margins.bottom);
+            const win_y: f32 = cursor_window.grid_position[1];
+            const win_height: f32 = @floatFromInt(cursor_window.grid_height);
+            grid_y = @max(grid_y, win_y + top_border);
+            grid_y = @min(grid_y, win_y + win_height - 1.0 - bottom_border);
 
-            self.uniforms.cursor_offset_x = offset[0];
-            self.uniforms.cursor_offset_y = offset[1];
+            const screen_col: u16 = @intFromFloat(@max(0, grid_x));
+            const screen_row: u16 = @intFromFloat(@max(0, grid_y));
 
-            // Set cursor animating flag
-            self.cursor_animating = cursor_renderer.animating;
+            if (screen_row >= self.cells.size.rows or screen_col >= self.cells.size.columns) return;
 
-            // Get blink opacity for smooth blink
-            const blink_opacity = cursor_renderer.getBlinkOpacity();
-            const alpha: u8 = @intFromFloat(blink_opacity * 255);
+            // Set cursor position in uniforms
+            self.uniforms.cursor_pos = .{ screen_col, screen_row };
+
+            // Track cursor position for animation
+            self.last_cursor_grid_pos = .{ screen_col, screen_row };
+
+            // Instant cursor - no animation offset
+            self.uniforms.cursor_offset_x = 0;
+            self.uniforms.cursor_offset_y = 0;
+
+            // Debug: log every cursor update
+            log.err("CURSOR: grid={} local=({},{}) + win=({d:.0},{d:.0}) = screen=({},{})", .{
+                nvim.cursor_grid,
+                nvim.cursor_col,
+                nvim.cursor_row,
+                cursor_window.grid_position[0],
+                cursor_window.grid_position[1],
+                screen_col,
+                screen_row,
+            });
+
+            const alpha: u8 = 255;
 
             // Render cursor glyph
             const cursor_color_rgb = terminal.color.RGB{
@@ -1955,7 +1731,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ cursor_col, cursor_row },
+                .grid_pos = .{ screen_col, screen_row },
                 .color = .{ cursor_color_rgb.r, cursor_color_rgb.g, cursor_color_rgb.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
@@ -2085,8 +1861,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Unified timing
             const now = std.time.Instant.now() catch return;
             const last = self.last_frame_time orelse now;
-            const dt_ns: f32 = @floatFromInt(now.since(last));
-            const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
+            // Safety: Check if time went backwards (can happen with system clock adjustments)
+            const dt: f32 = if (now.order(last) == .lt) blk: {
+                break :blk 1.0 / 60.0; // Default to 60fps if time went backwards
+            } else blk: {
+                const dt_ns: f32 = @floatFromInt(now.since(last));
+                break :blk @min(dt_ns / std.time.ns_per_s, 0.1);
+            };
 
             if (self.cursor_animating or self.scroll_animating) {
                 self.last_frame_time = now;
@@ -2096,21 +1877,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update cursor animation if active
             if (self.cursor_animating) {
-                // Time calculated above
-
                 const cursor_len = self.config.cursor_animation_duration;
                 const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
                 self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
 
-                // Update uniform offsets
-                const pos = self.cursor_animation.getPosition();
-                const cursor_x = self.uniforms.cursor_pos[0];
-                const cursor_y = self.uniforms.cursor_pos[1];
-                if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                    const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
-                    const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
-                    self.uniforms.cursor_offset_x = pos.x - target_x;
-                    self.uniforms.cursor_offset_y = pos.y - target_y;
+                // For terminal mode, update uniform offsets here
+                // For neovim mode, offsets are set in renderNeovimCursor
+                if (self.nvim_gui == null) {
+                    const pos = self.cursor_animation.getPosition();
+                    const cursor_x = self.uniforms.cursor_pos[0];
+                    const cursor_y = self.uniforms.cursor_pos[1];
+                    if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
+                        const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
+                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                        self.uniforms.cursor_offset_x = pos.x - target_x;
+                        self.uniforms.cursor_offset_y = pos.y - target_y;
+                    }
                 }
             }
 
@@ -2131,9 +1913,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // For alternate screen (TUI apps like Neovim), there's no mouse-driven scrollback,
             // but we STILL need the cell_h shift to align content correctly with the viewport.
             // The difference is we don't apply scroll_pixel_offset (mouse scroll) in alternate screen.
-            //
-            // IMPORTANT: We use in_alternate_screen (not tui_scroll_active) to ensure consistent
-            // positioning from the moment we enter alternate screen, not just when OSC 9999 is received.
             const base_offset: f32 = if (self.in_alternate_screen)
                 // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
                 cell_h
@@ -2141,12 +1920,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
                 cell_h - self.scroll_pixel_offset;
             self.uniforms.pixel_scroll_offset_y = base_offset;
-
-            // TUI scroll animation (Neovide-style per-cell offset)
-            // This is now handled directly in the vertex shader - cells within the scroll region
-            // get shifted by tui_scroll_offset_y, while header/statusline stay fixed.
-            // The scroll_animation_state.spring.position gives us the current offset.
-            // We'll update this in the animation section below.
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
@@ -2223,48 +1996,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.custom_shader_state = null;
             }
 
-            // Initialize TUI scrollback for Neovide-style per-line ring buffer scrolling.
-            // This approach stores row data and reads with an offset during animation.
-            if (self.config.pixel_scroll) {
-                if (self.tui_scrollback == null) {
-                    self.tui_scrollback = try tui_scroll.TuiScrollback.init(self.alloc);
-                }
-                // Resize scrollback if grid size changed
-                if (self.tui_scrollback) |*scrollback| {
-                    try scrollback.resize(self.cells.size.rows, self.cells.size.columns);
-                }
-            } else if (self.tui_scrollback) |*scrollback| {
-                scrollback.deinit();
-                self.tui_scrollback = null;
-            }
-
-            // OLD TEXTURE BLENDING APPROACH - DISABLED
-            // The shared_scroll_state is no longer used. Ring buffer approach is superior.
-            if (self.shared_scroll_state) |*state| {
-                state.deinit();
-                self.shared_scroll_state = null;
-            }
-
-            // Queue scroll events to the TUI scrollback (Neovide-style ring buffer approach)
-            if (self.tui_scroll_delta != 0) {
-                if (self.tui_scrollback) |*scrollback| {
-                    // Queue the scroll event - will be processed in flush()
-                    scrollback.queueScroll(self.tui_scroll_delta, self.tui_scroll_top, self.tui_scroll_bot, self.tui_scroll_left, self.tui_scroll_right);
-
-                    log.warn("TUI Scroll queued: delta={} top={} bot={} left={} right={}", .{
-                        self.tui_scroll_delta,
-                        self.tui_scroll_top,
-                        self.tui_scroll_bot,
-                        self.tui_scroll_left,
-                        self.tui_scroll_right,
-                    });
-
-                    self.scroll_animating = true;
-                }
-                // Consume the delta
-                self.tui_scroll_delta = 0;
-            }
-
             // If our stored size doesn't match the
             // surface size we need to update it.
             if (size_changed) {
@@ -2288,15 +2019,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.size.screen.height,
                 );
                 frame.target_config_modified = self.target_config_modified;
-
-                // Also resize the shared scroll state textures if they exist
-                if (self.shared_scroll_state) |*scroll_state| {
-                    try scroll_state.resize(
-                        self.api,
-                        self.size.screen.width,
-                        self.size.screen.height,
-                    );
-                }
             }
 
             // Upload images to the GPU as necessary.
@@ -2308,84 +2030,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
 
-            // RING BUFFER APPROACH: We no longer use texture blending.
-            // The tui_scrollback ring buffer handles animation by modifying self.cells
-            // to read from stored row data with an offset. No need for prev/curr frame textures.
-            //
-            // Disable the old scroll_state completely when using ring buffer.
-            const has_scroll_state = false; // Disabled - using ring buffer instead
-
-            // ===== NEOVIDE-STYLE RING BUFFER SCROLLING =====
-            // The key insight: instead of blending textures (which doesn't work because
-            // content is already updated), we store per-row data in a ring buffer and
-            // read from it with an offset during animation.
-            //
-            // 1. flush() rotates the buffer and copies current content
-            // 2. If animating, we modify self.cells to read from scrollback with offset
-            // 3. Sub-pixel offset goes to tui_scroll_offset_y uniform for vertex shader
-
-            const cell_height_f: f32 = @floatFromInt(self.grid_metrics.cell_height);
-            var tui_scrollback_animating = false;
-
-            if (self.tui_scrollback) |*scrollback| {
-                // Flush pending scrolls and update animation
-                const animation_duration = self.config.scroll_animation_duration;
-                try scrollback.flush(&self.cells, cell_height_f, animation_duration);
-
-                tui_scrollback_animating = scrollback.is_animating;
-
-                if (scrollback.is_animating) {
-                    // NEOVIDE-STYLE APPROACH:
-                    // 1. populateCellsForRender() reads from scrollback at (offset + screen_row)
-                    //    and populates cells for GPU sync. When offset is negative, we read
-                    //    old content from negative indices.
-                    // 2. getSubLineOffset() gives fractional pixel offset for smooth sub-pixel
-                    //    animation in the vertex shader.
-                    try scrollback.populateCellsForRender(&self.cells);
-
-                    // Note: pixel_scroll_offset_y is set to 0 in TUI mode (above), so content
-                    // is at its natural grid position. The tui_scroll_offset_y provides the
-                    // animation offset applied only to cells within the scroll region.
-
-                    // Sub-pixel offset for smooth animation within scroll region only
-                    self.uniforms.tui_scroll_offset_y = scrollback.getSubLineOffset(cell_height_f);
-
-                    log.warn("TUI Scroll: pos={d:.2} tui_offset_y={d:.1}px pixel_scroll={d:.1}px", .{
-                        scrollback.scroll_animation.position,
-                        self.uniforms.tui_scroll_offset_y,
-                        self.uniforms.pixel_scroll_offset_y,
-                    });
-                } else {
-                    self.uniforms.tui_scroll_offset_y = 0;
-                }
-            } else {
-                self.uniforms.tui_scroll_offset_y = 0;
-            }
-
-            // Update scroll_animating flag based on new scrollback state
-            if (tui_scrollback_animating) {
-                self.scroll_animating = true;
-            } else if (self.shared_scroll_state) |scroll_state| {
-                // Fall back to old scroll state if it's animating
-                self.scroll_animating = scroll_state.is_animating;
-            } else {
-                self.scroll_animating = false;
-            }
-
             // Setup our frame data
-            if (has_scroll_state) {
-                // Pass 1 uniforms: Exclude cursor
-                self.uniforms.bools.exclude_cursor = true;
-                try frame.uniforms.sync(&.{self.uniforms});
-
-                // Pass 3 uniforms: Include cursor
-                self.uniforms.bools.exclude_cursor = false;
-                try frame.uniforms_cursor.sync(&.{self.uniforms});
-            } else {
-                // Normal render: Include cursor
-                self.uniforms.bools.exclude_cursor = false;
-                try frame.uniforms.sync(&.{self.uniforms});
-            }
+            // Normal render: Include cursor
+            self.uniforms.bools.exclude_cursor = false;
+            try frame.uniforms.sync(&.{self.uniforms});
 
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
@@ -2419,19 +2067,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
-            // Scroll blending is DISABLED - using ring buffer approach instead.
-            // The ring buffer modifies self.cells directly, no texture blending needed.
-            const scroll_blending = false;
-
             // Determine the render target for main content:
-            // - If scroll state exists: ALWAYS render to curr_frame (for frame capture)
-            // - Else if custom shaders: render to custom shader back_texture
+            // - If custom shaders: render to custom shader back_texture
             // - Else: render directly to frame target
             {
                 var pass = frame_ctx.renderPass(&.{.{
-                    .target = if (has_scroll_state)
-                        .{ .texture = self.shared_scroll_state.?.curr_frame }
-                    else if (frame.custom_shader_state) |state|
+                    .target = if (frame.custom_shader_state) |state|
                         .{ .texture = state.back_texture }
                     else
                         .{ .target = frame.target },
@@ -2529,181 +2170,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             }
 
-            // Handle scroll animation state output
-            if (has_scroll_state) {
-                if (self.shared_scroll_state) |*scroll_state| {
-                    if (scroll_blending) {
-                        // Animation is active - update spring and blend frames
-                        const animation_duration = self.config.scroll_animation_duration;
-
-                        // Update the critically damped spring animation
-                        const still_animating = scroll_state.updateSpring(dt, animation_duration);
-                        if (!still_animating) {
-                            self.scroll_animating = false;
-                        }
-
-                        // Get current animation values
-                        const scroll_offset_pixels = scroll_state.getScrollOffset();
-                        const blend_factor = scroll_state.getBlendFactor();
-
-                        // Sync scroll blend uniforms (Neovide-style with scroll region)
-                        const blend_cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                        const blend_padding_t: f32 = @floatFromInt(self.size.padding.top);
-
-                        // Calculate scroll region in pixels from row indices
-                        // scroll_region_top/bot are row indices from OSC 9999
-                        //
-                        // For TUI apps (Neovim), there's NO terminal scrollback offset to account for.
-                        // The pixel_scroll_offset_y is only for terminal scrollback (mouse/trackpad),
-                        // not for TUI scroll regions.
-                        //
-                        // Row layout:
-                        //   - Row 0 starts at y = padding_top
-                        //   - Row N starts at y = padding_top + N * cell_height
-                        //   - scroll_region_top = first scrollable row (rows before are fixed header)
-                        //   - scroll_region_bot = first non-scrollable row at bottom (statusline)
-                        const scroll_top_px = blend_padding_t + @as(f32, @floatFromInt(self.tui_scroll_top)) * blend_cell_h;
-                        const scroll_bot_px = blend_padding_t + @as(f32, @floatFromInt(if (self.tui_scroll_bot == 0) self.cells.size.rows else self.tui_scroll_bot)) * blend_cell_h;
-
-                        log.warn("Scroll blend: offset={d:.1} blend={d:.2} top={d:.0} bot={d:.0} cell_h={d:.0} animating={}", .{
-                            scroll_offset_pixels,
-                            blend_factor,
-                            scroll_top_px,
-                            scroll_bot_px,
-                            blend_cell_h,
-                            scroll_state.is_animating,
-                        });
-
-                        try scroll_state.uniforms.sync(&.{.{
-                            .blend_factor = blend_factor,
-                            // Animation direction:
-                            // - Spring starts at delta_pixels and animates toward 0
-                            // - At START: spring.position = delta, we want to show prev_frame shifted
-                            // - At END: spring.position = 0, prev_frame should be at same position as curr
-                            //
-                            // In the shader, we do: prev_y = frag_pos.y + scroll_offset_y
-                            // So scroll_offset_y should be the spring.position directly:
-                            // - At START: offset = delta, sample from prev_frame at shifted position
-                            // - At END: offset = 0, sample from prev_frame at current position
-                            .scroll_offset_y = scroll_offset_pixels,
-                            .screen_height = @floatFromInt(self.size.screen.height),
-                            .screen_width = @floatFromInt(self.size.screen.width),
-                            .cell_height = blend_cell_h,
-                            .scroll_region_top = scroll_top_px,
-                            .scroll_region_bot = scroll_bot_px,
-                            .padding_top = blend_padding_t,
-                        }});
-
-                        // Determine output target for blend pass
-                        var blend_pass = frame_ctx.renderPass(&.{.{
-                            .target = if (frame.custom_shader_state) |state|
-                                .{ .texture = state.back_texture }
-                            else
-                                .{ .target = frame.target },
-                            .clear_color = null, // Don't clear, we're replacing
-                        }});
-                        defer blend_pass.complete();
-
-                        blend_pass.step(.{
-                            .pipeline = self.shaders.pipelines.scroll_blend,
-                            .uniforms = scroll_state.uniforms.buffer,
-                            .textures = &.{
-                                scroll_state.prev_frame,
-                                scroll_state.curr_frame,
-                            },
-                            .samplers = &.{scroll_state.sampler},
-                            .draw = .{
-                                .type = .triangle,
-                                .vertex_count = 3,
-                            },
-                        });
-                    } else {
-                        // Not animating, but we rendered to curr_frame.
-                        // Copy curr_frame to the output target (or custom shader back_texture).
-                        // Use blend_factor = 1.0 to just show curr_frame.
-                        const copy_cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                        const copy_padding_t: f32 = @floatFromInt(self.size.padding.top);
-
-                        try scroll_state.uniforms.sync(&.{.{
-                            .blend_factor = 1.0,
-                            .scroll_offset_y = 0.0,
-                            .screen_height = @floatFromInt(self.size.screen.height),
-                            .screen_width = @floatFromInt(self.size.screen.width),
-                            .cell_height = copy_cell_h,
-                            .scroll_region_top = copy_padding_t, // Start from padding (doesn't matter with blend=1.0)
-                            .scroll_region_bot = @as(f32, @floatFromInt(self.size.screen.height)), // Full height
-                            .padding_top = copy_padding_t,
-                        }});
-
-                        var copy_pass = frame_ctx.renderPass(&.{.{
-                            .target = if (frame.custom_shader_state) |state|
-                                .{ .texture = state.back_texture }
-                            else
-                                .{ .target = frame.target },
-                            .clear_color = null,
-                        }});
-                        defer copy_pass.complete();
-
-                        copy_pass.step(.{
-                            .pipeline = self.shaders.pipelines.scroll_blend,
-                            .uniforms = scroll_state.uniforms.buffer,
-                            .textures = &.{
-                                scroll_state.curr_frame, // prev = curr (doesn't matter with blend=1.0)
-                                scroll_state.curr_frame,
-                            },
-                            .samplers = &.{scroll_state.sampler},
-                            .draw = .{
-                                .type = .triangle,
-                                .vertex_count = 3,
-                            },
-                        });
-
-                        // Swap textures so next frame's prev_frame has this frame's content
-                        scroll_state.captureFrame();
-                    }
-                }
-
-                // Pass 3: Draw Cursor (after scroll blending)
-                // This draws the cursor on top of the blended frame, at its new position.
-                // It uses the "include cursor" uniforms (uniforms_cursor buffer).
-
-                // We draw only the first list of cells, which contains all cursor glyphs
-                // because we modified cell.zig setCursor to always use list[0].
-                var cursor_count: usize = 0;
-                if (self.cells.fg_rows.lists.len > 0) {
-                    cursor_count = self.cells.fg_rows.lists[0].items.len;
-                }
-
-                if (cursor_count > 0) {
-                    var cursor_pass = frame_ctx.renderPass(&.{.{
-                        .target = if (frame.custom_shader_state) |state|
-                            .{ .texture = state.back_texture }
-                        else
-                            .{ .target = frame.target },
-                        .clear_color = null, // Don't clear
-                    }});
-                    defer cursor_pass.complete();
-
-                    cursor_pass.step(.{
-                        .pipeline = self.shaders.pipelines.cell_text,
-                        .uniforms = frame.uniforms_cursor.buffer, // Use cursor uniforms (exclude=false)
-                        .buffers = &.{
-                            frame.cells.buffer,
-                            frame.cells_bg.buffer,
-                        },
-                        .textures = &.{
-                            frame.grayscale,
-                            frame.color,
-                        },
-                        .draw = .{
-                            .type = .triangle_strip,
-                            .vertex_count = 4,
-                            .instance_count = cursor_count, // Only draw cursor cells
-                        },
-                    });
-                }
-            }
-
             // If we have custom shaders, then we render them.
             if (frame.custom_shader_state) |*state| {
                 // Sync our uniforms.
@@ -2732,13 +2198,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                     });
                 }
-            }
-
-            // RESTORE CELLS: If we modified self.cells for TUI scroll animation,
-            // we must restore the clean content (from scrollback) so the next frame
-            // doesn't read corrupted data.
-            if (self.tui_scrollback) |*scrollback| {
-                try scrollback.restoreCells(&self.cells);
             }
         }
 

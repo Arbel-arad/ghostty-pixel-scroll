@@ -114,18 +114,36 @@ pub const CursorRenderer = struct {
     prev_dest_x: f32 = -1000,
     prev_dest_y: f32 = -1000,
 
+    /// Previous grid ID - for detecting window changes (like Neovide's previous_cursor_position)
+    prev_grid: u64 = 0,
+
     /// Cursor size
     width: f32 = 10,
     height: f32 = 20,
 
     /// Animation settings
-    animation_length: f32 = 0.13,
-    short_animation_length: f32 = 0.04,
-    trail_size: f32 = 0.7, // 0 = no trail, 1 = max trail
+    animation_length: f32 = 0.06, // 60ms for longer jumps
+    short_animation_length: f32 = 0.015, // 15ms for typing (nearly instant)
+    trail_size: f32 = 0.5, // 0 = no trail, 1 = max trail
 
     /// Blink state
     blink_time: f32 = 0,
-    blink_rate: f32 = 1.0,
+    /// Time to wait before starting to blink (ms converted to seconds)
+    blink_wait: f32 = 0.7,
+    /// Time cursor is on during blink (ms converted to seconds)
+    blink_on: f32 = 0.4,
+    /// Time cursor is off during blink (ms converted to seconds)
+    blink_off: f32 = 0.25,
+    /// Whether blinking is enabled
+    blink_enabled: bool = true,
+    /// Current blink opacity (for smooth transitions)
+    blink_opacity: f32 = 1.0,
+    /// Target blink opacity
+    blink_target: f32 = 1.0,
+    /// Whether we're in the initial wait period
+    in_blink_wait: bool = true,
+    /// Smooth blink transition speed (higher = faster)
+    blink_smooth_speed: f32 = 8.0,
 
     /// Whether animating
     animating: bool = false,
@@ -145,15 +163,24 @@ pub const CursorRenderer = struct {
         return self;
     }
 
-    /// Set cursor position (called when Neovim sends cursor_goto)
-    /// col/row are grid coordinates (0-indexed)
-    pub fn setCursorPosition(self: *Self, col: u16, row: u16, cell_w: f32, cell_h: f32) void {
+    /// Set cursor position with grid tracking (called from renderer)
+    /// Following Neovide: if grid changes, snap immediately; otherwise animate
+    /// col/row are SCREEN coordinates (already includes window offset)
+    pub fn setCursorPositionWithGrid(self: *Self, grid: u64, col: u16, row: u16, cell_w: f32, cell_h: f32) void {
         self.width = cell_w;
         self.height = cell_h;
 
         // Destination is top-left of cursor cell (like Neovide)
         const new_dest_x = @as(f32, @floatFromInt(col)) * cell_w;
         const new_dest_y = @as(f32, @floatFromInt(row)) * cell_h;
+
+        // If grid changed, snap immediately (don't animate across windows)
+        // This matches Neovide's behavior where previous_cursor_position includes window ID
+        if (grid != self.prev_grid) {
+            self.prev_grid = grid;
+            self.snap(col, row, cell_w, cell_h);
+            return;
+        }
 
         // Only mark as jumped if position actually changed
         if (new_dest_x != self.dest_x or new_dest_y != self.dest_y) {
@@ -165,13 +192,18 @@ pub const CursorRenderer = struct {
         }
     }
 
+    /// Set cursor position (called when Neovim sends cursor_goto)
+    /// col/row are SCREEN coordinates (0-indexed)
+    pub fn setCursorPosition(self: *Self, col: u16, row: u16, cell_w: f32, cell_h: f32) void {
+        // For now, always snap for instant cursor movement (no animation lag)
+        // TODO: Re-enable animation once frame timing is fixed
+        self.snap(col, row, cell_w, cell_h);
+    }
+
     /// Update animation state
     pub fn update(self: *Self, dt: f32) bool {
-        // Update blink
-        self.blink_time += dt;
-        if (self.blink_time > self.blink_rate * 2) {
-            self.blink_time -= self.blink_rate * 2;
-        }
+        // Update blink timing
+        self.updateBlink(dt);
 
         // Center destination for corners
         const center_x = self.dest_x + self.width / 2;
@@ -181,6 +213,8 @@ pub const CursorRenderer = struct {
         if (self.jumped) {
             self.setupCornerAnimations(center_x, center_y);
             self.jumped = false;
+            // Reset blink when cursor moves (like Neovide)
+            self.resetBlink();
         }
 
         // Update each corner
@@ -276,9 +310,70 @@ pub const CursorRenderer = struct {
 
     /// Get blink opacity (0.0 to 1.0)
     pub fn getBlinkOpacity(self: *const Self) f32 {
-        // Simple sine wave blink
-        const phase = self.blink_time / self.blink_rate * std.math.pi;
-        return (@cos(phase) + 1.0) / 2.0;
+        if (!self.blink_enabled) return 1.0;
+        return self.blink_opacity;
+    }
+
+    /// Update blink state with smooth transitions
+    fn updateBlink(self: *Self, dt: f32) void {
+        if (!self.blink_enabled) {
+            self.blink_opacity = 1.0;
+            return;
+        }
+
+        self.blink_time += dt;
+
+        // Determine target opacity based on blink cycle
+        if (self.in_blink_wait) {
+            // During wait period, cursor is always visible
+            self.blink_target = 1.0;
+            if (self.blink_time >= self.blink_wait) {
+                self.blink_time -= self.blink_wait;
+                self.in_blink_wait = false;
+            }
+        } else {
+            // Blinking cycle: on -> off -> on -> off...
+            const cycle_time = self.blink_on + self.blink_off;
+            const cycle_pos = @mod(self.blink_time, cycle_time);
+
+            if (cycle_pos < self.blink_on) {
+                self.blink_target = 1.0; // Cursor on
+            } else {
+                self.blink_target = 0.0; // Cursor off
+            }
+        }
+
+        // Smooth transition to target opacity
+        const diff = self.blink_target - self.blink_opacity;
+        if (@abs(diff) < 0.01) {
+            self.blink_opacity = self.blink_target;
+        } else {
+            self.blink_opacity += diff * self.blink_smooth_speed * dt;
+            self.blink_opacity = std.math.clamp(self.blink_opacity, 0.0, 1.0);
+        }
+    }
+
+    /// Reset blink state (called when cursor moves)
+    pub fn resetBlink(self: *Self) void {
+        self.blink_time = 0;
+        self.in_blink_wait = true;
+        self.blink_opacity = 1.0;
+        self.blink_target = 1.0;
+    }
+
+    /// Set blink timing from Neovim mode_info
+    /// Times are in milliseconds, 0 means disabled
+    pub fn setBlinkTiming(self: *Self, blinkwait: ?u64, blinkon: ?u64, blinkoff: ?u64) void {
+        // Convert from ms to seconds, use defaults if not specified
+        self.blink_wait = if (blinkwait) |w| @as(f32, @floatFromInt(w)) / 1000.0 else 0.7;
+        self.blink_on = if (blinkon) |on| @as(f32, @floatFromInt(on)) / 1000.0 else 0.4;
+        self.blink_off = if (blinkoff) |off| @as(f32, @floatFromInt(off)) / 1000.0 else 0.25;
+
+        // Blinking is disabled if any timing is 0
+        self.blink_enabled = self.blink_on > 0 and self.blink_off > 0;
+
+        // Reset blink state when timing changes
+        self.resetBlink();
     }
 
     /// Snap cursor to position immediately (no animation)

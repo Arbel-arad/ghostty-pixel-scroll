@@ -17,6 +17,11 @@ pub const IoThread = io_thread.IoThread;
 pub const EventQueue = io_thread.EventQueue;
 pub const Event = io_thread.Event;
 pub const HlAttr = Event.HlAttr;
+pub const CursorMode = Event.CursorMode;
+pub const CursorShape = Event.CursorShape;
+pub const OptionValue = Event.OptionValue;
+pub const StyledContent = io_thread.StyledContent;
+pub const MessageKind = io_thread.MessageKind;
 
 pub const RenderedWindow = @import("rendered_window.zig").RenderedWindow;
 pub const ScrollCommand = @import("rendered_window.zig").ScrollCommand;
@@ -81,8 +86,48 @@ pub const NeovimGui = struct {
     /// Current mode index
     current_mode_idx: u64 = 0,
 
+    /// Cursor modes from mode_info_set event (indexed by mode_idx)
+    cursor_modes: []CursorMode = &.{},
+
+    /// Whether cursor style is enabled (from mode_info_set)
+    cursor_style_enabled: bool = true,
+
     /// Neovide-style cursor renderer with trail and particles
     cursor_renderer: CursorRenderer = CursorRenderer.init(),
+
+    /// Busy state (Neovim is processing)
+    is_busy: bool = false,
+
+    /// Mouse enabled state
+    mouse_enabled: bool = true,
+
+    /// Suspend state (Ctrl+Z was pressed)
+    suspended: bool = false,
+
+    /// Restart state (Neovim is restarting, preserves state)
+    restarting: bool = false,
+
+    /// Window title from Neovim (set_title event)
+    title: []const u8 = "",
+
+    /// Window icon name from Neovim (set_icon event, rarely used)
+    icon: []const u8 = "",
+
+    /// Neovim options received via option_set event
+    /// Key is the option name (owned), value is the option value
+    options: std.StringHashMap(OptionValue),
+
+    // Message state (ext_messages)
+    /// Current messages from msg_show events
+    messages: std.ArrayListUnmanaged(Event.MsgShow) = .empty,
+    /// Mode display content from msg_showmode (e.g., "-- INSERT --")
+    showmode_content: []StyledContent = &.{},
+    /// Partial command content from msg_showcmd
+    showcmd_content: []StyledContent = &.{},
+    /// Ruler content from msg_ruler (line/col info)
+    ruler_content: []StyledContent = &.{},
+    /// Message history from msg_history_show
+    message_history: []Event.MsgHistoryEntry = &.{},
 
     pub fn init(alloc: Allocator) !*Self {
         const self = try alloc.create(Self);
@@ -91,6 +136,7 @@ pub const NeovimGui = struct {
             .event_queue = EventQueue.init(alloc),
             .windows = std.AutoHashMap(u64, *RenderedWindow).init(alloc),
             .hl_attrs = std.AutoHashMap(u64, HlAttr).init(alloc),
+            .options = std.StringHashMap(OptionValue).init(alloc),
         };
         return self;
     }
@@ -119,6 +165,41 @@ pub const NeovimGui = struct {
         self.windows.deinit();
 
         self.hl_attrs.deinit();
+
+        // Free cursor modes if allocated
+        if (self.cursor_modes.len > 0) {
+            self.alloc.free(self.cursor_modes);
+        }
+
+        // Free title and icon strings if allocated
+        if (self.title.len > 0) {
+            self.alloc.free(self.title);
+        }
+        if (self.icon.len > 0) {
+            self.alloc.free(self.icon);
+        }
+
+        // Free options - both keys and string values are owned
+        var opt_it = self.options.iterator();
+        while (opt_it.next()) |entry| {
+            // Free the key (option name)
+            self.alloc.free(entry.key_ptr.*);
+            // Free string values
+            switch (entry.value_ptr.*) {
+                .string => |s| self.alloc.free(s),
+                else => {},
+            }
+        }
+        self.options.deinit();
+
+        // Free message state
+        self.clearMessages();
+        self.messages.deinit(self.alloc);
+        self.freeStyledContent(self.showmode_content);
+        self.freeStyledContent(self.showcmd_content);
+        self.freeStyledContent(self.ruler_content);
+        self.freeMessageHistory();
+
         self.alloc.destroy(self);
     }
 
@@ -143,6 +224,10 @@ pub const NeovimGui = struct {
         try self.io.?.start();
 
         self.ready = true;
+
+        // Force resize - Neovim may ignore the size in attachUi
+        try self.io.?.resizeUi(self.grid_width, self.grid_height);
+
         log.info("Connected to Neovim successfully", .{});
     }
 
@@ -167,6 +252,10 @@ pub const NeovimGui = struct {
         try self.io.?.start();
 
         self.ready = true;
+
+        // Force resize - Neovim may ignore the size in attachUi
+        try self.io.?.resizeUi(self.grid_width, self.grid_height);
+
         log.info("Embedded Neovim spawned successfully", .{});
     }
 
@@ -186,11 +275,24 @@ pub const NeovimGui = struct {
         // Remove any existing socket
         std.fs.deleteFileAbsolute(socket_path) catch {};
 
-        // Spawn nvim --listen <socket>
-        var child = std.process.Child.init(&.{ "nvim", "--listen", socket_path }, self.alloc);
+        // Spawn nvim --headless --listen <socket>
+        // Support passing additional args via GHOSTTY_NVIM_ARGS env var (e.g., "--clean")
+        const extra_args_str = std.posix.getenv("GHOSTTY_NVIM_ARGS");
+
+        const args: []const []const u8 = if (extra_args_str) |extra| blk: {
+            log.info("GHOSTTY_NVIM_ARGS: {s}", .{extra});
+            // For simplicity, just support --clean for now
+            if (std.mem.indexOf(u8, extra, "--clean")) |_| {
+                log.info("Launching Neovim with --clean", .{});
+                break :blk &.{ "nvim", "--clean", "--headless", "--listen", socket_path };
+            }
+            break :blk &.{ "nvim", "--headless", "--listen", socket_path };
+        } else &.{ "nvim", "--headless", "--listen", socket_path };
+
+        var child = std.process.Child.init(args, self.alloc);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Inherit;
+        child.stderr_behavior = .Ignore;
         try child.spawn();
 
         // Wait for socket to be available (Neovim needs time to start)
@@ -223,6 +325,10 @@ pub const NeovimGui = struct {
         try self.io.?.start();
 
         self.ready = true;
+
+        // Force resize - Neovim may ignore the size in attachUi
+        try self.io.?.resizeUi(self.grid_width, self.grid_height);
+
         log.info("Connected to spawned Neovim successfully", .{});
     }
 
@@ -235,7 +341,9 @@ pub const NeovimGui = struct {
 
         // Process all events
         for (self.local_events.items) |*event| {
-            self.handleEvent(event.*) catch {};
+            self.handleEvent(event.*) catch |err| {
+                log.err("Event error: {}", .{err});
+            };
             event.deinit(self.alloc);
         }
         self.local_events.clearRetainingCapacity();
@@ -256,34 +364,23 @@ pub const NeovimGui = struct {
                 self.handleGridClear(grid);
             },
             .grid_cursor_goto => |data| {
-                const first_position = (self.cursor_row == 0 and self.cursor_col == 0 and
-                    self.cursor_renderer.dest_x == 0 and self.cursor_renderer.dest_y == 0);
+                // Store GRID-LOCAL coordinates - window offset applied at render time
+                // This matches Neovide's approach: cursor stores (grid_id, local_pos)
+                // and the renderer adds window.grid_position when drawing
                 self.cursor_grid = data.grid;
                 self.cursor_row = data.row;
                 self.cursor_col = data.col;
-
-                // On first cursor position, snap immediately (no animation from 0,0)
-                if (first_position) {
-                    self.cursor_renderer.snap(
-                        @intCast(data.col),
-                        @intCast(data.row),
-                        self.cell_width,
-                        self.cell_height,
-                    );
-                } else {
-                    self.cursor_renderer.setCursorPosition(
-                        @intCast(data.col),
-                        @intCast(data.row),
-                        self.cell_width,
-                        self.cell_height,
-                    );
-                }
                 self.dirty = true;
+
+                // NOTE: We don't update cursor_renderer here anymore.
+                // The renderer will calculate screen position and update cursor_renderer
+                // at render time when it has the most up-to-date window positions.
             },
             .win_pos => |data| {
                 try self.handleWinPos(data);
             },
             .win_float_pos => |data| {
+                log.info("SWITCH: win_float_pos event received for grid={}", .{data.grid});
                 try self.handleWinFloatPos(data);
             },
             .win_viewport => |data| {
@@ -300,6 +397,16 @@ pub const NeovimGui = struct {
                     self.alloc.destroy(kv.value);
                 }
             },
+            .grid_destroy => |grid| {
+                // grid_destroy: grid will not be used anymore, remove it
+                if (self.windows.fetchRemove(grid)) |kv| {
+                    kv.value.deinit();
+                    self.alloc.destroy(kv.value);
+                }
+            },
+            .msg_set_pos => |data| {
+                try self.handleMsgSetPos(data);
+            },
             .hl_attr_define => |data| {
                 try self.hl_attrs.put(data.id, data.attr);
             },
@@ -309,6 +416,16 @@ pub const NeovimGui = struct {
                 self.default_special = data.sp;
                 self.dirty = true;
             },
+            .mode_info_set => |data| {
+                // Free old cursor modes if any
+                if (self.cursor_modes.len > 0) {
+                    self.alloc.free(self.cursor_modes);
+                }
+                // Store new cursor modes (take ownership of the slice)
+                self.cursor_modes = self.alloc.dupe(CursorMode, data.cursor_modes) catch &.{};
+                self.cursor_style_enabled = data.cursor_style_enabled;
+                self.dirty = true;
+            },
             .mode_change => |data| {
                 self.current_mode_idx = data.mode_idx;
                 self.dirty = true;
@@ -316,16 +433,266 @@ pub const NeovimGui = struct {
             .flush => {
                 self.flush();
             },
-            else => {},
+            .suspend_event => {
+                log.info("Neovim suspend event received", .{});
+                self.suspended = true;
+                // TODO: Could trigger terminal suspend behavior here
+            },
+            .restart => {
+                log.info("Neovim restart event received", .{});
+                self.restarting = true;
+                // Clear state and wait for re-initialization
+                self.ready = false;
+            },
+            .busy_start => {
+                self.is_busy = true;
+            },
+            .busy_stop => {
+                self.is_busy = false;
+            },
+            .mouse_on => {
+                self.mouse_enabled = true;
+            },
+            .mouse_off => {
+                self.mouse_enabled = false;
+            },
+            .set_title => |new_title| {
+                log.info("set_title: {s}", .{new_title});
+                // Free old title if allocated
+                if (self.title.len > 0) {
+                    self.alloc.free(self.title);
+                }
+                // Dupe since event.deinit will free the original
+                self.title = self.alloc.dupe(u8, new_title) catch "";
+            },
+            .set_icon => |new_icon| {
+                log.info("set_icon: {s}", .{new_icon});
+                // Free old icon if allocated
+                if (self.icon.len > 0) {
+                    self.alloc.free(self.icon);
+                }
+                // Dupe since event.deinit will free the original
+                self.icon = self.alloc.dupe(u8, new_icon) catch "";
+            },
+            .win_viewport_margins => |data| {
+                self.handleWinViewportMargins(data);
+            },
+            .win_external_pos => |data| {
+                self.handleWinExternalPos(data);
+            },
+            .option_set => |data| {
+                try self.handleOptionSet(data);
+            },
+            // Command line events (ext_cmdline) - just log for now
+            .cmdline_show => |data| {
+                log.info("cmdline_show: level={} pos={} firstc='{s}' prompt='{s}' indent={}", .{
+                    data.level,
+                    data.pos,
+                    data.firstc,
+                    data.prompt,
+                    data.indent,
+                });
+                self.dirty = true;
+            },
+            .cmdline_hide => |data| {
+                log.info("cmdline_hide: level={}", .{data.level});
+                self.dirty = true;
+            },
+            .cmdline_pos => |data| {
+                log.info("cmdline_pos: pos={} level={}", .{ data.pos, data.level });
+                self.dirty = true;
+            },
+            .cmdline_special_char => |data| {
+                log.info("cmdline_special_char: char='{s}' shift={} level={}", .{
+                    data.character,
+                    data.shift,
+                    data.level,
+                });
+                self.dirty = true;
+            },
+            .cmdline_block_show => |data| {
+                log.info("cmdline_block_show: {} lines", .{data.lines.len});
+                self.dirty = true;
+            },
+            .cmdline_block_hide => {
+                log.info("cmdline_block_hide", .{});
+                self.dirty = true;
+            },
+            .cmdline_block_append => |data| {
+                log.info("cmdline_block_append: {} content items", .{data.line.len});
+                self.dirty = true;
+            },
+            // Message events (ext_messages)
+            .msg_show => |data| {
+                log.info("msg_show: kind={} replace_last={} content_items={}", .{
+                    @intFromEnum(data.kind),
+                    data.replace_last,
+                    data.content.len,
+                });
+                // If replace_last, remove the last message
+                if (data.replace_last and self.messages.items.len > 0) {
+                    if (self.messages.pop()) |last| {
+                        for (last.content) |sc| {
+                            self.alloc.free(sc.text);
+                        }
+                        self.alloc.free(last.content);
+                    }
+                }
+                // Dupe the content since event.deinit will free the original
+                const content_dupe = try self.dupeStyledContent(data.content);
+                try self.messages.append(self.alloc, .{
+                    .kind = data.kind,
+                    .content = content_dupe,
+                    .replace_last = data.replace_last,
+                });
+                self.dirty = true;
+            },
+            .msg_clear => {
+                log.info("msg_clear", .{});
+                self.clearMessages();
+                self.dirty = true;
+            },
+            .msg_showmode => |data| {
+                log.info("msg_showmode: {} content items", .{data.content.len});
+                // Free old content
+                self.freeStyledContent(self.showmode_content);
+                // Dupe new content
+                self.showmode_content = try self.dupeStyledContent(data.content);
+                self.dirty = true;
+            },
+            .msg_showcmd => |data| {
+                log.info("msg_showcmd: {} content items", .{data.content.len});
+                // Free old content
+                self.freeStyledContent(self.showcmd_content);
+                // Dupe new content
+                self.showcmd_content = try self.dupeStyledContent(data.content);
+                self.dirty = true;
+            },
+            .msg_ruler => |data| {
+                log.info("msg_ruler: {} content items", .{data.content.len});
+                // Free old content
+                self.freeStyledContent(self.ruler_content);
+                // Dupe new content
+                self.ruler_content = try self.dupeStyledContent(data.content);
+                self.dirty = true;
+            },
+            .msg_history_show => |data| {
+                log.info("msg_history_show: {} entries", .{data.entries.len});
+                // Free old history
+                self.freeMessageHistory();
+                // Dupe new history
+                if (data.entries.len > 0) {
+                    var new_history = try self.alloc.alloc(Event.MsgHistoryEntry, data.entries.len);
+                    errdefer self.alloc.free(new_history);
+
+                    var i: usize = 0;
+                    errdefer {
+                        for (new_history[0..i]) |entry| {
+                            for (entry.content) |sc| {
+                                self.alloc.free(sc.text);
+                            }
+                            self.alloc.free(entry.content);
+                        }
+                    }
+
+                    for (data.entries) |entry| {
+                        new_history[i] = .{
+                            .kind = entry.kind,
+                            .content = try self.dupeStyledContent(entry.content),
+                        };
+                        i += 1;
+                    }
+                    self.message_history = new_history;
+                }
+                self.dirty = true;
+            },
+            // Highlight group set
+            .hl_group_set => |data| {
+                log.info("hl_group_set: {s} -> {}", .{ data.name, data.hl_id });
+                // Store in a hashmap if needed - for now just log
+                self.dirty = true;
+            },
+            // Window extmark (Neovim 0.10+)
+            .win_extmark => |data| {
+                log.info("win_extmark: grid={} win={}", .{ data.grid, data.win });
+                // Extmarks are for advanced features - store if needed
+                self.dirty = true;
+            },
+            // Popup menu events
+            .popupmenu_show => |data| {
+                log.info("popupmenu_show: {} items, selected={}, pos=({},{})", .{
+                    data.items.len,
+                    data.selected,
+                    data.row,
+                    data.col,
+                });
+                // Store popup state for rendering if ext_popupmenu is enabled
+                self.dirty = true;
+            },
+            .popupmenu_select => |data| {
+                log.info("popupmenu_select: {}", .{data.selected});
+                self.dirty = true;
+            },
+            .popupmenu_hide => {
+                log.info("popupmenu_hide", .{});
+                self.dirty = true;
+            },
+            // Tabline events
+            .tabline_update => |data| {
+                log.info("tabline_update: current_tab={}, {} tabs", .{ data.current_tab, data.tabs.len });
+                // Store tabline state for rendering if ext_tabline is enabled
+                self.dirty = true;
+            },
+        }
+    }
+
+    fn handleOptionSet(self: *Self, data: Event.OptionSet) !void {
+        log.info("handleOptionSet: {s}", .{data.name});
+
+        // Check if this option already exists
+        if (self.options.fetchRemove(data.name)) |existing| {
+            // Free old key and value
+            self.alloc.free(existing.key);
+            switch (existing.value) {
+                .string => |s| self.alloc.free(s),
+                else => {},
+            }
+        }
+
+        // Dupe the name and value since event.deinit will free them
+        const name_dupe = try self.alloc.dupe(u8, data.name);
+        errdefer self.alloc.free(name_dupe);
+
+        const value_dupe: OptionValue = switch (data.value) {
+            .string => |s| .{ .string = try self.alloc.dupe(u8, s) },
+            .integer => |i| .{ .integer = i },
+            .boolean => |b| .{ .boolean = b },
+        };
+        errdefer {
+            switch (value_dupe) {
+                .string => |s| self.alloc.free(s),
+                else => {},
+            }
+        }
+
+        try self.options.put(name_dupe, value_dupe);
+
+        // Log specific important options
+        switch (value_dupe) {
+            .string => |s| log.info("  option_set: {s} = \"{s}\"", .{ name_dupe, s }),
+            .integer => |i| log.info("  option_set: {s} = {}", .{ name_dupe, i }),
+            .boolean => |b| log.info("  option_set: {s} = {}", .{ name_dupe, b }),
         }
     }
 
     fn handleGridResize(self: *Self, grid: u64, width: u64, height: u64) !void {
-        log.debug("Grid resize: grid={} {}x{}", .{ grid, width, height });
+        log.info("handleGridResize START: grid={} {}x{}", .{ grid, width, height });
 
         const window = try self.getOrCreateWindow(grid);
+        log.info("handleGridResize: got window grid={} old_size={}x{}", .{ grid, window.grid_width, window.grid_height });
         try window.resize(@intCast(width), @intCast(height));
         self.dirty = true;
+        log.info("handleGridResize DONE: grid={} new_size={}x{}", .{ grid, window.grid_width, window.grid_height });
     }
 
     fn handleGridLine(self: *Self, grid: u64, row: u64, col_start: u64, cells: []const Event.Cell) void {
@@ -374,37 +741,145 @@ pub const NeovimGui = struct {
     }
 
     fn handleWinPos(self: *Self, data: Event.WinPos) !void {
-        log.info("handleWinPos: grid={} row={} col={}", .{ data.grid, data.start_row, data.start_col });
+        log.info("handleWinPos START: grid={} row={} col={} size={}x{}", .{ data.grid, data.start_row, data.start_col, data.width, data.height });
         const window = try self.getOrCreateWindow(data.grid);
+        log.info("handleWinPos: got window grid={} old_size={}x{}", .{ data.grid, window.grid_width, window.grid_height });
         window.setPosition(data.start_row, data.start_col, data.width, data.height);
         window.window_type = .editor;
         self.dirty = true;
+        log.info("handleWinPos DONE: grid={} final_pos=({d:.1},{d:.1})", .{ data.grid, window.grid_position[0], window.grid_position[1] });
     }
 
     fn handleWinFloatPos(self: *Self, data: Event.WinFloatPos) !void {
-        const window = try self.getOrCreateWindow(data.grid);
+        // CRITICAL DEBUG - this MUST print
+        log.err("=== handleWinFloatPos ENTERED === grid={}", .{data.grid});
+        log.info("handleWinFloatPos START: grid={} anchor_grid={} anchor={} raw=({d:.1},{d:.1}) zindex={}", .{
+            data.grid,
+            data.anchor_grid,
+            @intFromEnum(data.anchor),
+            data.anchor_col,
+            data.anchor_row,
+            data.zindex,
+        });
 
-        // Floating windows are positioned relative to an anchor grid
-        // For simplicity, we use the anchor_row/anchor_col directly as the position
-        // These are in grid coordinates (rows/columns)
-        const start_row: u64 = @intFromFloat(@max(0, data.anchor_row));
-        const start_col: u64 = @intFromFloat(@max(0, data.anchor_col));
+        const window = try self.getOrCreateWindow(data.grid);
+        log.info("handleWinFloatPos: got window grid={} size={}x{}", .{ data.grid, window.grid_width, window.grid_height });
+
+        // Get parent window position (anchor grid)
+        const parent_pos: [2]f32 = if (self.windows.get(data.anchor_grid)) |parent|
+            parent.grid_position
+        else
+            .{ 0, 0 };
+        log.info("handleWinFloatPos: parent_pos=({d:.1},{d:.1})", .{ parent_pos[0], parent_pos[1] });
+
+        // Calculate position based on anchor type (like Neovide's modified_top_left)
+        // The anchor position is relative to the anchor grid
+        const width_f: f32 = @floatFromInt(window.grid_width);
+        const height_f: f32 = @floatFromInt(window.grid_height);
+
+        var left: f32 = data.anchor_col;
+        var top: f32 = data.anchor_row;
+
+        // Adjust position based on anchor type
+        switch (data.anchor) {
+            .NW => {
+                log.info("handleWinFloatPos: anchor NW, no adjustment", .{});
+            },
+            .NE => {
+                // top-right corner: window extends left from anchor
+                left = data.anchor_col - width_f;
+                log.info("handleWinFloatPos: anchor NE, left={d:.1} - {d:.1} = {d:.1}", .{ data.anchor_col, width_f, left });
+            },
+            .SW => {
+                // bottom-left corner: window extends up from anchor
+                top = data.anchor_row - height_f;
+                log.info("handleWinFloatPos: anchor SW, top={d:.1} - {d:.1} = {d:.1}", .{ data.anchor_row, height_f, top });
+            },
+            .SE => {
+                // bottom-right corner: window extends up and left from anchor
+                left = data.anchor_col - width_f;
+                top = data.anchor_row - height_f;
+                log.info("handleWinFloatPos: anchor SE, left={d:.1}, top={d:.1}", .{ left, top });
+            },
+        }
+
+        // Add parent position offset
+        left += parent_pos[0];
+        top += parent_pos[1];
+
+        log.info("handleWinFloatPos: after parent offset left={d:.1} top={d:.1}", .{ left, top });
+
+        // Clamp to valid range
+        left = @max(0, left);
+        top = @max(0, top);
+
+        const start_row: u64 = @intFromFloat(top);
+        const start_col: u64 = @intFromFloat(left);
+
+        log.info("handleWinFloatPos: FINAL grid={} pos=({},{}) zindex={}", .{ data.grid, start_col, start_row, data.zindex });
 
         window.setFloatPosition(start_row, start_col, data.zindex);
         window.window_type = .floating;
         self.dirty = true;
-
-        log.debug("Float window: grid={} pos=({d:.1},{d:.1}) zindex={}", .{
-            data.grid,
-            data.anchor_row,
-            data.anchor_col,
-            data.zindex,
-        });
     }
 
     fn handleWinViewport(self: *Self, data: Event.WinViewport) void {
         const window = self.windows.get(data.grid) orelse return;
         window.setViewport(data.topline, data.botline, data.scroll_delta);
+    }
+
+    fn handleWinViewportMargins(self: *Self, data: Event.WinViewportMargins) void {
+        const window = self.windows.get(data.grid) orelse return;
+        window.viewport_margins = .{
+            .top = @intCast(data.top),
+            .bottom = @intCast(data.bottom),
+            .left = @intCast(data.left),
+            .right = @intCast(data.right),
+        };
+        log.info("win_viewport_margins: grid={} top={} bottom={} left={} right={}", .{
+            data.grid,
+            data.top,
+            data.bottom,
+            data.left,
+            data.right,
+        });
+        self.dirty = true;
+    }
+
+    fn handleWinExternalPos(self: *Self, data: Event.WinExternalPos) void {
+        const window = self.windows.get(data.grid) orelse return;
+        window.is_external = true;
+        log.info("win_external_pos: grid={} win={} - marked as external window", .{ data.grid, data.win });
+        self.dirty = true;
+    }
+
+    fn handleMsgSetPos(self: *Self, data: Event.MsgSetPos) !void {
+        log.info("handleMsgSetPos START: grid={} row={} zindex={}", .{ data.grid, data.row, data.zindex });
+
+        // msg_set_pos positions the message/cmdline grid
+        // It's a FLOATING window anchored to grid 1 at the specified row
+        // Uses parent (grid 1) width for the message grid
+        const window = try self.getOrCreateWindow(data.grid);
+        log.info("handleMsgSetPos: got window grid={} size={}x{}", .{ data.grid, window.grid_width, window.grid_height });
+
+        // Get parent (grid 1) width - like Neovide does
+        const parent_width: u32 = if (self.windows.get(1)) |grid1|
+            grid1.grid_width
+        else
+            self.grid_width;
+
+        // Use the new setMessagePosition method which sets anchor_info
+        window.setMessagePosition(data.row, data.zindex, parent_width);
+        self.dirty = true;
+
+        log.info("handleMsgSetPos DONE: grid={} row={} zindex={} parent_width={} final_pos=({d:.1},{d:.1})", .{
+            data.grid,
+            data.row,
+            data.zindex,
+            parent_width,
+            window.grid_position[0],
+            window.grid_position[1],
+        });
     }
 
     fn getOrCreateWindow(self: *Self, grid: u64) !*RenderedWindow {
@@ -456,6 +931,15 @@ pub const NeovimGui = struct {
             .foreground = self.default_foreground,
             .background = self.default_background,
         };
+    }
+
+    /// Get the current cursor mode based on mode_idx
+    /// Returns null if cursor_style is disabled or mode_idx is out of range
+    pub fn getCurrentCursorMode(self: *const Self) ?CursorMode {
+        if (!self.cursor_style_enabled) return null;
+        if (self.cursor_modes.len == 0) return null;
+        if (self.current_mode_idx >= self.cursor_modes.len) return null;
+        return self.cursor_modes[self.current_mode_idx];
     }
 
     /// Resize the UI
@@ -515,6 +999,103 @@ pub const NeovimGui = struct {
     /// Clear dirty flag
     pub fn clearDirty(self: *Self) void {
         self.dirty = false;
+    }
+
+    // Message state accessors (for renderer)
+
+    /// Get current messages to display
+    pub fn getMessages(self: *const Self) []const Event.MsgShow {
+        return self.messages.items;
+    }
+
+    /// Get current mode display (e.g., "-- INSERT --")
+    pub fn getShowModeContent(self: *const Self) []const StyledContent {
+        return self.showmode_content;
+    }
+
+    /// Get current partial command display
+    pub fn getShowCmdContent(self: *const Self) []const StyledContent {
+        return self.showcmd_content;
+    }
+
+    /// Get current ruler content (line/col info)
+    pub fn getRulerContent(self: *const Self) []const StyledContent {
+        return self.ruler_content;
+    }
+
+    /// Get message history
+    pub fn getMessageHistory(self: *const Self) []const Event.MsgHistoryEntry {
+        return self.message_history;
+    }
+
+    /// Check if there are any messages to display
+    pub fn hasMessages(self: *const Self) bool {
+        return self.messages.items.len > 0;
+    }
+
+    /// Check if there's any statusline content (showmode, showcmd, or ruler)
+    pub fn hasStatusLineContent(self: *const Self) bool {
+        return self.showmode_content.len > 0 or
+            self.showcmd_content.len > 0 or
+            self.ruler_content.len > 0;
+    }
+
+    // Message state helpers (private)
+
+    /// Free styled content array
+    fn freeStyledContent(self: *Self, content: []StyledContent) void {
+        for (content) |sc| {
+            self.alloc.free(sc.text);
+        }
+        if (content.len > 0) {
+            self.alloc.free(content);
+        }
+    }
+
+    /// Clear all messages
+    fn clearMessages(self: *Self) void {
+        for (self.messages.items) |*msg| {
+            msg.deinit(self.alloc);
+        }
+        self.messages.clearRetainingCapacity();
+    }
+
+    /// Free message history
+    fn freeMessageHistory(self: *Self) void {
+        for (self.message_history) |entry| {
+            for (entry.content) |sc| {
+                self.alloc.free(sc.text);
+            }
+            self.alloc.free(entry.content);
+        }
+        if (self.message_history.len > 0) {
+            self.alloc.free(self.message_history);
+            self.message_history = &.{};
+        }
+    }
+
+    /// Duplicate styled content array
+    fn dupeStyledContent(self: *Self, content: []const StyledContent) ![]StyledContent {
+        if (content.len == 0) return &.{};
+
+        var result = try self.alloc.alloc(StyledContent, content.len);
+        errdefer self.alloc.free(result);
+
+        var i: usize = 0;
+        errdefer {
+            for (result[0..i]) |sc| {
+                self.alloc.free(sc.text);
+            }
+        }
+
+        for (content) |sc| {
+            result[i] = .{
+                .attr_id = sc.attr_id,
+                .text = try self.alloc.dupe(u8, sc.text),
+            };
+            i += 1;
+        }
+        return result;
     }
 };
 

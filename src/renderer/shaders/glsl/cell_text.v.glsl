@@ -28,16 +28,12 @@ const uint ATLAS_COLOR = 1u;
 // Masks for the `glyph_bools` attribute
 const uint NO_MIN_CONTRAST = 1u;
 const uint IS_CURSOR_GLYPH = 2u;
-const uint IS_SCROLL_GLYPH = 4u;
 
 out CellTextVertexOut {
     flat uint atlas;
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
-    vec2 screen_pos;  // For clipping during scroll
-    flat uvec2 grid_pos_out;
-    flat uint is_in_scroll_region; // Only clip cells that are part of the scroll region
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -49,20 +45,6 @@ void main() {
     uvec2 cursor_pos = unpack2u16(cursor_pos_packed_2u16);
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
-    
-    // Determine effective scroll region (bot/right = 0 means use grid size)
-    uint effective_scroll_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
-    uint effective_scroll_right = scroll_region_right == 0u ? grid_size.x : scroll_region_right;
-
-    // Check if this cell is strictly inside the scroll region boundaries
-    bool in_scroll_bounds = grid_pos.y >= scroll_region_top && grid_pos.y < effective_scroll_bot &&
-                            grid_pos.x >= scroll_region_left && grid_pos.x < effective_scroll_right;
-
-    // Apply scroll offset ONLY if inside bounds or explicitly flagged as a scroll glyph
-    bool apply_scroll = in_scroll_bounds || ((glyph_bools & IS_SCROLL_GLYPH) != 0u);
-
-    out_data.is_in_scroll_region = apply_scroll ? 1u : 0u;
-    out_data.grid_pos_out = grid_pos;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);
@@ -94,17 +76,7 @@ void main() {
     
     // Apply pixel scroll offset (base grid alignment)
     // In terminal mode: shifts content up to hide an extra row for smooth scrollback.
-    // In TUI mode: this is 0, content stays at natural grid position.
     cell_pos.y -= pixel_scroll_offset_y;
-    
-    // Apply TUI scroll animation offset (Neovide-style)
-    // This offset is ONLY applied to cells within the scroll region.
-    // Cells in the header (above scroll_region_top) or statusline (at/below scroll_region_bot)
-    // are NOT shifted - they stay fixed in place like Neovide does.
-    if (tui_scroll_offset_y != 0.0 && apply_scroll) {
-        cell_pos.y += tui_scroll_offset_y;
-    }
-
     
     // Apply cursor animation offset if this is the cursor glyph
     if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
@@ -119,9 +91,6 @@ void main() {
         cell_pos.y += cursor_offset_y;
     }
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
-    
-    // Pass screen position for edge clipping in fragment shader
-    out_data.screen_pos = cell_pos;
 
     // Calculate the texture coordinate in pixels. This is NOT normalized
     // (between 0.0 and 1.0), and does not need to be, since the texture will

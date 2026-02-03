@@ -40,11 +40,6 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
             .step_fn = .per_instance,
             .blending_enabled = true,
         } },
-        .{ "scroll_blend", .{
-            .vertex_fn = loadShaderCode("../shaders/glsl/full_screen.v.glsl"),
-            .fragment_fn = loadShaderCode("../shaders/glsl/scroll_blend.f.glsl"),
-            .blending_enabled = false,
-        } },
     };
 
 /// All the comptime-known info about a pipeline, so that
@@ -211,22 +206,6 @@ pub const Uniforms = extern struct {
     cursor_offset_x: f32 align(4) = 0,
     cursor_offset_y: f32 align(4) = 0,
 
-    /// Scroll region for TUI smooth scrolling.
-    /// Rows outside this region don't scroll (status bar, cmdline, etc.)
-    /// scroll_region_top: first scrollable row (rows above are fixed)
-    /// scroll_region_bot: last scrollable row (rows at/below are fixed), 0 = grid height
-    scroll_region_top: u32 align(4) = 0,
-    scroll_region_bot: u32 align(4) = 0,
-
-    /// TUI scroll animation offset in pixels (Neovide-style).
-    /// This is applied to cells within the scroll region to create smooth scrolling.
-    /// Starts at the full delta and animates toward 0.
-    tui_scroll_offset_y: f32 align(4) = 0,
-
-    /// Horizontal scroll region for split windows (NvimTree etc.)
-    scroll_region_left: u32 align(4) = 0,
-    scroll_region_right: u32 align(4) = 0,
-
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,
@@ -274,8 +253,7 @@ pub const CellText = extern struct {
     bools: packed struct(u8) {
         no_min_contrast: bool = false,
         is_cursor_glyph: bool = false,
-        is_scroll_glyph: bool = false,
-        _padding: u5 = 0,
+        _padding: u6 = 0,
     } align(1) = .{},
 
     pub const Atlas = enum(u8) {

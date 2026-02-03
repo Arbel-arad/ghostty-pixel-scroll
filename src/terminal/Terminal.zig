@@ -77,22 +77,6 @@ modes: modespkg.ModeState = .{},
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse_shape_pkg.MouseShape = .text,
 
-/// TUI scroll delta from Neovim OSC 9999 for smooth scrolling animation.
-/// This is consumed by the renderer to animate scrolling.
-/// Positive = scroll down, negative = scroll up.
-tui_scroll_delta: i32 = 0,
-/// Top row of scroll region (rows above this don't scroll - e.g., tabline)
-tui_scroll_top: u32 = 0,
-/// Bottom row of scroll region (rows at or below don't scroll - e.g., statusline)
-/// 0 means "use grid height" (no bottom margin)
-tui_scroll_bot: u32 = 0,
-/// Left column of scroll region (0-indexed, cols left of this are fixed)
-tui_scroll_left: u32 = 0,
-/// Right column of scroll region (exclusive, 0 = use grid width)
-tui_scroll_right: u32 = 0,
-/// Whether we've seen OSC 9999 hints (TUI mode active)
-tui_scroll_active: bool = false,
-
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This isn't a mode, this is set by OSC 133 using the "A" event.

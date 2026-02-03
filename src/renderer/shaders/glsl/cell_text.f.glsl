@@ -8,9 +8,6 @@ in CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     vec2 tex_coord;
-    vec2 screen_pos;  // For clipping during scroll
-    flat uvec2 grid_pos_out;
-    flat uint is_in_scroll_region; // Only clip cells that are part of the scroll region
 } in_data;
 
 // Values `atlas` can take.
@@ -21,34 +18,8 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
-    // Manual clipping for TUI scroll region
-    // When scroll_region is active (scroll_region_top > 0), we need to clip content
-    // to prevent it from drawing outside the scroll region bounds.
-    // This is needed both during animation AND when content overflows.
-    if (scroll_region_top > 0u && in_data.is_in_scroll_region != 0u) {
-        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-        uint eff_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
-        uint eff_right = scroll_region_right == 0u ? grid_size.x : scroll_region_right;
-        
-        // Calculate clip bounds in screen space
-        // These are the fixed boundaries where scroll region content should appear
-        float top_y = float(scroll_region_top) * cell_size.y - pixel_scroll_offset_y;
-        float bot_y = float(eff_bot) * cell_size.y - pixel_scroll_offset_y;
-        float left_x = float(scroll_region_left) * cell_size.x;
-        float right_x = float(eff_right) * cell_size.x;
-
-        // Clip any fragment that falls outside the scroll region bounds
-        if (in_data.screen_pos.y < top_y || in_data.screen_pos.y >= bot_y ||
-            in_data.screen_pos.x < left_x || in_data.screen_pos.x >= right_x) {
-            discard;
-        }
-    }
-
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
-    
-    // NOTE: For TUI smooth scrolling, clipping is handled by the scroll_blend shader.
-    // The scroll_blend shader composites prev/curr frames with proper region handling.
 
     switch (in_data.atlas) {
         default:

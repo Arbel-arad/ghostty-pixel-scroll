@@ -2545,6 +2545,7 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // We have to update the IO thread no matter what because we send
     // pixel-level sizing to the subprocess.
     const grid_size = self.size.grid();
+
     if (grid_size.columns < 5 and (self.size.padding.left > 0 or self.size.padding.right > 0)) {
         log.warn("WARNING: very small terminal grid detected with padding " ++
             "set. Is your padding reasonable?", .{});
@@ -2554,8 +2555,24 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
             "set. Is your padding reasonable?", .{});
     }
 
+    // DEBUG: Always log resize dimensions
+    log.info("SURFACE RESIZE: screen={}x{}px cell={}x{}px grid={}x{}cells padding top={} bottom={} nvim_mode={}", .{
+        self.size.screen.width,
+        self.size.screen.height,
+        self.size.cell.width,
+        self.size.cell.height,
+        grid_size.columns,
+        grid_size.rows,
+        self.size.padding.top,
+        self.size.padding.bottom,
+        self.nvim_gui != null,
+    });
+
     // If in Neovim GUI mode, resize the Neovim UI
     if (self.nvim_gui) |nvim| {
+        // Tell Neovim the EXACT grid size - don't subtract anything
+        // Neovide doesn't subtract either, they match window size to grid exactly
+        std.log.info("NEOVIM RESIZE: Terminal grid {}x{} -> Telling Neovim same size", .{ grid_size.columns, grid_size.rows });
         nvim.resize(
             grid_size.columns,
             grid_size.rows,
@@ -2573,6 +2590,11 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (!self.config.window_padding_balance) return;
+
+    // Enable balanced padding for Neovim to center content vertically
+    // This handles the case where window height > grid height
+    // if (self.nvim_gui != null) return;
+
     const content_scale = try self.rt_surface.getContentScale();
     const x_dpi = content_scale.x * font.face.default_dpi;
     const y_dpi = content_scale.y * font.face.default_dpi;
