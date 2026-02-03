@@ -1906,20 +1906,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning.
-            // Ghostty always renders with an extra row above the viewport for smooth scrollback,
-            // so we need to shift content UP by cell_h to hide it and align the grid properly.
-            //
-            // For alternate screen (TUI apps like Neovim), there's no mouse-driven scrollback,
-            // but we STILL need the cell_h shift to align content correctly with the viewport.
-            // The difference is we don't apply scroll_pixel_offset (mouse scroll) in alternate screen.
-            const base_offset: f32 = if (self.in_alternate_screen)
-                // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
-                cell_h
-            else
-                // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
-                cell_h - self.scroll_pixel_offset;
-            self.uniforms.pixel_scroll_offset_y = base_offset;
+            // For Neovim GUI mode, pixel_scroll_offset_y is set in updateFrameNeovim
+            // Don't override it here
+            if (self.nvim_gui == null) {
+                // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning.
+                // Ghostty always renders with an extra row above the viewport for smooth scrollback,
+                // so we need to shift content UP by cell_h to hide it and align the grid properly.
+                //
+                // For alternate screen (TUI apps like Neovim), there's no mouse-driven scrollback,
+                // but we STILL need the cell_h shift to align content correctly with the viewport.
+                // The difference is we don't apply scroll_pixel_offset (mouse scroll) in alternate screen.
+                const base_offset: f32 = if (self.in_alternate_screen)
+                    // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
+                    cell_h
+                else
+                    // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
+                    cell_h - self.scroll_pixel_offset;
+                self.uniforms.pixel_scroll_offset_y = base_offset;
+            }
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
