@@ -96,8 +96,26 @@ void main() {
             return;
         }
         
-        cell_pos.x += cursor_offset_x;
-        cell_pos.y += cursor_offset_y;
+        if (cursor_use_corners != 0u) {
+            // Neovide-style stretchy cursor: each vertex uses its animated corner position
+            // Vertex order in quad: vid 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+            // corner.x: 0=left, 1=right; corner.y: 0=top, 1=bottom
+            vec2 corner_pos;
+            if (corner.x < 0.5 && corner.y < 0.5) {
+                corner_pos = cursor_corner_tl;
+            } else if (corner.x >= 0.5 && corner.y < 0.5) {
+                corner_pos = cursor_corner_tr;
+            } else if (corner.x < 0.5 && corner.y >= 0.5) {
+                corner_pos = cursor_corner_bl;
+            } else {
+                corner_pos = cursor_corner_br;
+            }
+            cell_pos = corner_pos;
+        } else {
+            // Simple offset-based animation (fallback)
+            cell_pos.x += cursor_offset_x;
+            cell_pos.y += cursor_offset_y;
+        }
     }
     gl_Position = projection_matrix * vec4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
 

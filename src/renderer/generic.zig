@@ -210,6 +210,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Last known cursor grid position (for detecting cursor movement)
         last_cursor_grid_pos: [2]u16 = .{ 0, 0 },
 
+        /// Last known scroll position (for detecting scroll changes)
+        last_cursor_scroll_pos: f32 = 0,
+
         /// Whether cursor animation is currently active (needs continuous render)
         cursor_animating: bool = false,
 
@@ -1510,11 +1513,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.scroll_animating = any_animating;
 
-            // Update cursor animation - MUST be in same timing as scroll to stay in sync
-            if (self.cursor_animating) {
-                const cursor_len = self.config.cursor_animation_duration;
-                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
-                self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+            // Update corner cursor animation (Neovide-style stretchy cursor)
+            // MUST be in same timing as scroll to stay in sync
+            // Always call update() unconditionally - it's cheap and ensures corners
+            // continue animating even if cursor_animating flag gets out of sync
+            {
+                const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                self.cursor_animating = self.corner_cursor.update(dt, cell_width, cell_height);
             }
 
             // Step 3: Render with current position and updated scrollback
@@ -1779,7 +1785,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Render scrollable region
-                // Iterate 0..inner_size (the extra +1 row is handled by scrollback containing 2x size)
                 var inner_row: u32 = 0;
                 while (inner_row < inner_size) : (inner_row += 1) {
                     var col: u32 = 0;
@@ -1858,8 +1863,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             if (grid_cell) |cell| {
                                 const text = cell.getText();
                                 if (text.len > 0) {
-                                    // Scrollable rows get the scroll pixel offset
-                                    self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
+                                    // Don't apply scroll offset to edge rows to prevent bleeding
+                                    // into margins (bufferline at top, statusline at bottom)
+                                    const is_first_row = inner_row == 0;
+                                    const is_last_row = inner_row == inner_size - 1;
+                                    // Negative offset = content shifting UP, first row bleeds into top margin
+                                    // Positive offset = content shifting DOWN, last row bleeds into bottom margin
+                                    const skip_offset = (is_first_row and scroll_pixel_offset < 0 and margin_top > 0) or
+                                        (is_last_row and scroll_pixel_offset > 0 and margin_bottom > 0);
+                                    const effective_offset = if (skip_offset) 0 else scroll_pixel_offset;
+                                    self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, effective_offset) catch {};
                                 }
                             }
                         }
@@ -1959,67 +1972,56 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
             const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            // Get scroll animation position
+            // Get scroll animation position (like Neovide: grid.y -= window.scroll_animation.position)
             const scroll_pos = cursor_window.scroll_animation.position;
-            const is_scrolling = scroll_pos != 0;
 
             // Calculate grid position
             const local_col_f: f32 = @floatFromInt(nvim.cursor_col);
             const local_row_f: f32 = @floatFromInt(nvim.cursor_row);
             const grid_x = local_col_f + cursor_window.grid_position[0];
-            const grid_y_base = local_row_f + cursor_window.grid_position[1];
+            // Neovide subtracts scroll position from grid Y so cursor moves with content
+            const grid_y = local_row_f + cursor_window.grid_position[1] - scroll_pos;
 
-            // Screen position (integer grid cell)
+            // Screen position (integer grid cell) - for uniforms/cell lookup only
             const screen_col: u16 = @intFromFloat(@max(0, grid_x));
-            const screen_row: u16 = @intFromFloat(@max(0, grid_y_base));
+            const screen_row: u16 = @intFromFloat(@max(0, local_row_f + cursor_window.grid_position[1]));
 
             if (screen_row >= self.cells.size.rows or screen_col >= self.cells.size.columns) return;
 
-            // Set cursor position in uniforms
+            // Set cursor position in uniforms (integer position for cell lookup)
             self.uniforms.cursor_pos = .{ screen_col, screen_row };
 
-            // Pixel positions
+            // Pixel positions (top-left of cursor cell) - includes scroll offset
+            // This is the cursor's TARGET position that it animates toward
             const target_pixel_x: f32 = grid_x * cell_width;
-            const target_pixel_y: f32 = grid_y_base * cell_height;
+            const target_pixel_y: f32 = grid_y * cell_height;
 
-            // Scroll pixel offset (sub-cell smooth scrolling)
-            // MUST match getSubLineOffset exactly: (trunc(pos) - pos) * cell_height
-            const scroll_offset_lines = @trunc(scroll_pos);
-            const scroll_offset_y = (scroll_offset_lines - scroll_pos) * cell_height;
+            // Neovide-style: ALWAYS animate cursor, even during scroll
+            // The cursor destination moves with scroll, and corners animate toward it
+            const last_x = self.last_cursor_grid_pos[0];
+            const last_y = self.last_cursor_grid_pos[1];
+            const last_scroll = self.last_cursor_scroll_pos;
 
-            if (is_scrolling) {
-                // During scroll: NO cursor animation, just follow content exactly
-                // Snap cursor animation to current position
-                self.cursor_animation.current_x = target_pixel_x;
-                self.cursor_animation.current_y = target_pixel_y;
-                self.cursor_animation.target_x = target_pixel_x;
-                self.cursor_animation.target_y = target_pixel_y;
-                self.cursor_animation.spring.x.reset();
-                self.cursor_animation.spring.y.reset();
+            // Detect if cursor grid position changed OR scroll position changed
+            if (screen_col != last_x or screen_row != last_y or scroll_pos != last_scroll) {
+                // Position changed - set new target for corner animation
+                self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
                 self.last_cursor_grid_pos = .{ screen_col, screen_row };
-                self.cursor_animating = false;
-
-                // Apply scroll offset directly
-                self.uniforms.cursor_offset_x = 0;
-                self.uniforms.cursor_offset_y = scroll_offset_y;
-            } else {
-                // Not scrolling: normal cursor animation
-                const last_x = self.last_cursor_grid_pos[0];
-                const last_y = self.last_cursor_grid_pos[1];
-
-                if (screen_col != last_x or screen_row != last_y) {
-                    self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
-                    self.last_cursor_grid_pos = .{ screen_col, screen_row };
-                    self.cursor_animating = true;
-                }
-
-                // Get animated position
-                const pos = self.cursor_animation.getPosition();
-
-                // Calculate offset from target
-                self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
-                self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
+                self.last_cursor_scroll_pos = scroll_pos;
+                self.cursor_animating = true;
             }
+
+            // Get animated corner positions
+            const corners = self.corner_cursor.getCorners();
+
+            self.uniforms.cursor_corner_tl = corners[0];
+            self.uniforms.cursor_corner_tr = corners[1];
+            self.uniforms.cursor_corner_br = corners[2];
+            self.uniforms.cursor_corner_bl = corners[3];
+            // Set cursor_use_corners - type depends on backend (bool for Metal, u32 for OpenGL)
+            self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) true else 1;
+            self.uniforms.cursor_offset_x = 0;
+            self.uniforms.cursor_offset_y = 0;
 
             const alpha: u8 = 255;
 

@@ -238,11 +238,12 @@ pub const CursorAnimation = struct {
 
 /// Neovide-style corner-based cursor animation
 /// The cursor is rendered as a quad with 4 independently animated corners.
+/// Neovide-style stretchy cursor animation with 4 independently animated corners.
 /// Front corners (in direction of movement) animate faster than back corners,
-/// creating a stretchy trail effect.
+/// creating a stretchy trail effect. Exactly matches Neovide's implementation.
 pub const CornerCursorAnimation = struct {
     /// Corner positions relative to cursor center (-0.5 to 0.5 for each axis)
-    /// Order: top-left, top-right, bottom-right, bottom-left
+    /// Order: top-left, top-right, bottom-right, bottom-left (matches Neovide)
     const STANDARD_CORNERS: [4][2]f32 = .{
         .{ -0.5, -0.5 }, // top-left
         .{ 0.5, -0.5 }, // top-right
@@ -250,162 +251,248 @@ pub const CornerCursorAnimation = struct {
         .{ -0.5, 0.5 }, // bottom-left
     };
 
-    /// Corner state
+    /// Corner state - matches Neovide's Corner struct
     const Corner = struct {
         /// Current pixel position
-        current: [2]f32 = .{ 0, 0 },
-        /// Previous destination (to detect changes)
-        prev_dest: [2]f32 = .{ 0, 0 },
-        /// Spring for X animation
-        spring_x: Spring = .{},
-        /// Spring for Y animation
-        spring_y: Spring = .{},
-        /// Animation length for this corner (varies based on direction)
-        anim_length: f32 = 0.15,
+        current_position: [2]f32 = .{ 0, 0 },
         /// Relative position within cell (-0.5 to 0.5)
-        relative_pos: [2]f32 = .{ 0, 0 },
+        relative_position: [2]f32 = .{ 0, 0 },
+        /// Previous destination (to detect changes)
+        previous_destination: [2]f32 = .{ -1000, -1000 },
+        /// Spring for X animation
+        animation_x: Spring = .{},
+        /// Spring for Y animation
+        animation_y: Spring = .{},
+        /// Animation length for this corner (varies based on rank)
+        animation_length: f32 = 0.15,
 
-        fn update(self: *Corner, dt: f32, dest: [2]f32, cursor_width: f32, cursor_height: f32) bool {
-            // Calculate corner destination
-            const corner_dest: [2]f32 = .{
-                dest[0] + (self.relative_pos[0] + 0.5) * cursor_width,
-                dest[1] + (self.relative_pos[1] + 0.5) * cursor_height,
+        /// Get the destination position for this corner given cursor center destination
+        fn getDestination(self: *const Corner, center_dest: [2]f32, cursor_width: f32, cursor_height: f32) [2]f32 {
+            return .{
+                center_dest[0] + self.relative_position[0] * cursor_width,
+                center_dest[1] + self.relative_position[1] * cursor_height,
             };
+        }
 
-            // Check if destination changed
-            if (corner_dest[0] != self.prev_dest[0] or corner_dest[1] != self.prev_dest[1]) {
-                // Set spring to animate from current to new destination
-                self.spring_x.position = self.current[0] - corner_dest[0];
-                self.spring_y.position = self.current[1] - corner_dest[1];
-                self.prev_dest = corner_dest;
+        /// Calculate how aligned this corner is with travel direction (for ranking)
+        fn calculateDirectionAlignment(self: *const Corner, center_dest: [2]f32, cursor_width: f32, cursor_height: f32) f32 {
+            const corner_dest = self.getDestination(center_dest, cursor_width, cursor_height);
+
+            // Normalize relative position to get corner direction from center
+            const rel_len = @sqrt(self.relative_position[0] * self.relative_position[0] +
+                self.relative_position[1] * self.relative_position[1]);
+            const corner_dir: [2]f32 = if (rel_len > 0.001)
+                .{ self.relative_position[0] / rel_len, self.relative_position[1] / rel_len }
+            else
+                .{ 0, 0 };
+
+            // Travel direction from current to destination
+            const dx = corner_dest[0] - self.current_position[0];
+            const dy = corner_dest[1] - self.current_position[1];
+            const travel_len = @sqrt(dx * dx + dy * dy);
+            const travel_dir: [2]f32 = if (travel_len > 0.001)
+                .{ dx / travel_len, dy / travel_len }
+            else
+                .{ 0, 0 };
+
+            // Dot product gives alignment (-1 to 1)
+            return travel_dir[0] * corner_dir[0] + travel_dir[1] * corner_dir[1];
+        }
+
+        /// Update corner animation
+        fn update(self: *Corner, dt: f32, center_dest: [2]f32, cursor_width: f32, cursor_height: f32, immediate: bool) bool {
+            const corner_dest = self.getDestination(center_dest, cursor_width, cursor_height);
+
+            // Immediate movement - snap to destination
+            if (immediate) {
+                self.current_position = corner_dest;
+                self.previous_destination = corner_dest;
+                self.animation_x.reset();
+                self.animation_y.reset();
+                return false;
             }
 
-            // Update springs
-            var animating = self.spring_x.update(dt, self.anim_length, 1.0);
-            animating = self.spring_y.update(dt, self.anim_length, 1.0) or animating;
+            // Check if destination changed - reset spring to new delta
+            if (corner_dest[0] != self.previous_destination[0] or corner_dest[1] != self.previous_destination[1]) {
+                // Set spring to animate from current to new destination
+                // Neovide convention: delta = dest - current, then current = dest - spring.position
+                // Spring starts at delta and animates toward 0
+                self.animation_x.position = corner_dest[0] - self.current_position[0];
+                self.animation_y.position = corner_dest[1] - self.current_position[1];
+                self.previous_destination = corner_dest;
+            }
 
-            // Current position = destination + spring offset
-            self.current[0] = corner_dest[0] + self.spring_x.position;
-            self.current[1] = corner_dest[1] + self.spring_y.position;
+            // Update springs with critically damped response (zeta = 1.0)
+            var animating = self.animation_x.update(dt, self.animation_length, 1.0);
+            animating = self.animation_y.update(dt, self.animation_length, 1.0) or animating;
+
+            // Current position = destination - spring offset (spring starts at delta, animates toward 0)
+            // As spring.position approaches 0, current_position approaches destination
+            self.current_position[0] = corner_dest[0] - self.animation_x.position;
+            self.current_position[1] = corner_dest[1] - self.animation_y.position;
 
             return animating;
+        }
+
+        /// Set animation length based on rank (Neovide's jump logic)
+        fn setAnimationLengthByRank(self: *Corner, rank: usize, leading: f32, trailing: f32) void {
+            self.animation_length = switch (rank) {
+                // Leading corners (rank 2-3) move fastest
+                2, 3 => leading,
+                // Middle corner (rank 1) moves at average speed
+                1 => (leading + trailing) / 2.0,
+                // Trailing corner (rank 0) moves slowest
+                0 => trailing,
+                else => trailing,
+            };
         }
     };
 
     /// The 4 corners
     corners: [4]Corner = undefined,
-    /// Target position (top-left of cursor cell in pixels)
-    target: [2]f32 = .{ 0, 0 },
-    /// Previous target (to detect jumps)
-    prev_target: [2]f32 = .{ 0, 0 },
-    /// Base animation length
-    animation_length: f32 = 0.15,
-    /// Short animation for small movements
-    short_animation_length: f32 = 0.04,
-    /// Trail size (0.0 = no trail, 1.0 = full trail)
-    trail_size: f32 = 0.7,
-    /// Whether animation is enabled
-    enabled: bool = true,
+    /// Target position (CENTER of cursor in pixels) - Neovide uses center, not top-left
+    destination: [2]f32 = .{ 0, 0 },
+    /// Previous cursor position for detecting jumps
+    previous_destination: [2]f32 = .{ -1000, -1000 },
+    /// Whether we just jumped to a new position
+    jumped: bool = false,
+
+    // Neovide default settings (hardcoded to match exactly)
+    /// Base animation length (0.15 seconds)
+    const ANIMATION_LENGTH: f32 = 0.150;
+    /// Short animation for typing (0.04 seconds)
+    const SHORT_ANIMATION_LENGTH: f32 = 0.04;
+    /// Trail size (1.0 = full trail, leading corners jump instantly to destination)
+    const TRAIL_SIZE: f32 = 1.0;
 
     pub fn init() CornerCursorAnimation {
         var self = CornerCursorAnimation{};
         for (0..4) |i| {
             self.corners[i] = Corner{
-                .relative_pos = STANDARD_CORNERS[i],
+                .relative_position = STANDARD_CORNERS[i],
             };
         }
         return self;
     }
 
-    /// Set new target position and calculate corner animation lengths based on direction
+    /// Set new target position (called when cursor moves)
+    /// x, y = top-left of cursor cell in pixels
     pub fn setTarget(self: *CornerCursorAnimation, x: f32, y: f32, cell_width: f32, cell_height: f32) void {
-        if (!self.enabled) {
-            self.target = .{ x, y };
-            self.prev_target = .{ x, y };
-            for (&self.corners) |*corner| {
-                corner.current = .{
-                    x + (corner.relative_pos[0] + 0.5) * cell_width,
-                    y + (corner.relative_pos[1] + 0.5) * cell_height,
-                };
-            }
+        // Convert to center position (Neovide uses center for destination)
+        const center_x = x + cell_width * 0.5;
+        const center_y = y + cell_height * 0.5;
+
+        // On first call, snap immediately
+        if (self.previous_destination[0] < -500) {
+            self.snap(x, y, cell_width, cell_height);
             return;
         }
 
-        const dx = x - self.prev_target[0];
-        const dy = y - self.prev_target[1];
-
-        // Check if this is a small horizontal movement (typing)
-        const is_small_jump = @abs(dx) <= cell_width * 2.5 and @abs(dy) < 0.001;
-
-        // Calculate direction vector (normalized-ish)
-        const dist = @sqrt(dx * dx + dy * dy);
-        const dir_x = if (dist > 0.001) dx / dist else 0;
-        const dir_y = if (dist > 0.001) dy / dist else 0;
-
-        // Rank corners by alignment with movement direction
-        // Corners more aligned with direction get faster animation (leading edge)
-        for (&self.corners) |*corner| {
-            // Corner direction from center
-            const cx = corner.relative_pos[0];
-            const cy = corner.relative_pos[1];
-
-            // Dot product with movement direction
-            const dot = cx * dir_x + cy * dir_y;
-
-            // Rank: higher dot = more aligned = faster animation
-            // dot ranges from ~-0.7 to ~0.7
-            // Map to animation length: leading (dot > 0) = fast, trailing (dot < 0) = slow
-            const base_len = if (is_small_jump)
-                self.short_animation_length
-            else
-                self.animation_length;
-
-            const leading_len = base_len * (1.0 - self.trail_size);
-            const trailing_len = base_len;
-
-            // Interpolate between leading and trailing based on dot
-            const t = (dot + 0.7) / 1.4; // Normalize to 0..1
-            corner.anim_length = leading_len + (trailing_len - leading_len) * (1.0 - t);
-        }
-
-        self.target = .{ x, y };
-        self.prev_target = .{ x, y };
+        self.destination = .{ center_x, center_y };
+        self.jumped = true;
     }
 
-    /// Update all corners
+    /// Update animation - call this every frame
+    /// Returns true if still animating
     pub fn update(self: *CornerCursorAnimation, dt: f32, cell_width: f32, cell_height: f32) bool {
-        if (!self.enabled) return false;
+        // Handle jump - calculate ranks and set animation lengths
+        if (self.jumped) {
+            self.handleJump(cell_width, cell_height);
+            self.jumped = false;
+        }
 
         var animating = false;
         for (&self.corners) |*corner| {
-            if (corner.update(dt, self.target, cell_width, cell_height)) {
+            if (corner.update(dt, self.destination, cell_width, cell_height, false)) {
                 animating = true;
             }
         }
         return animating;
     }
 
+    /// Handle a cursor jump - calculate corner ranks and animation lengths
+    fn handleJump(self: *CornerCursorAnimation, cell_width: f32, cell_height: f32) void {
+        // Calculate direction alignment for each corner
+        var alignments: [4]f32 = undefined;
+        for (0..4) |i| {
+            alignments[i] = self.corners[i].calculateDirectionAlignment(self.destination, cell_width, cell_height);
+        }
+
+        // Sort corners by alignment to get ranks (Neovide sorts then re-sorts by id)
+        // We'll compute ranks directly: count how many corners have lower alignment
+        var ranks: [4]usize = undefined;
+        for (0..4) |i| {
+            var rank: usize = 0;
+            for (0..4) |j| {
+                if (i != j) {
+                    // Lower alignment = lower rank (trailing)
+                    if (alignments[j] < alignments[i]) {
+                        rank += 1;
+                    } else if (alignments[j] == alignments[i] and j < i) {
+                        // Tie-breaker: lower index = lower rank
+                        rank += 1;
+                    }
+                }
+            }
+            ranks[i] = rank;
+        }
+
+        // Calculate jump vector to determine if this is a small jump (typing)
+        const jump_x = (self.destination[0] - self.previous_destination[0]) / cell_width;
+        const jump_y = (self.destination[1] - self.previous_destination[1]) / cell_height;
+        const is_small_jump = @abs(jump_x) <= 2.001 and @abs(jump_y) < 0.001;
+
+        // Calculate leading and trailing animation times
+        const base_length = if (is_small_jump)
+            @min(ANIMATION_LENGTH, SHORT_ANIMATION_LENGTH)
+        else
+            ANIMATION_LENGTH;
+
+        // With TRAIL_SIZE = 1.0: leading = 0, so leading corners jump instantly!
+        const leading = base_length * (1.0 - TRAIL_SIZE);
+        const trailing = base_length;
+
+        // Set animation length for each corner based on rank
+        for (0..4) |i| {
+            self.corners[i].setAnimationLengthByRank(ranks[i], leading, trailing);
+        }
+
+        self.previous_destination = self.destination;
+    }
+
     /// Get corner positions for rendering (in pixel coordinates)
+    /// Returns: [TL, TR, BR, BL] corner positions
     pub fn getCorners(self: *const CornerCursorAnimation) [4][2]f32 {
         return .{
-            self.corners[0].current,
-            self.corners[1].current,
-            self.corners[2].current,
-            self.corners[3].current,
+            self.corners[0].current_position,
+            self.corners[1].current_position,
+            self.corners[2].current_position,
+            self.corners[3].current_position,
         };
     }
 
-    /// Snap all corners to target immediately
-    pub fn snap(self: *CornerCursorAnimation, cell_width: f32, cell_height: f32) void {
+    /// Snap all corners to a specific position immediately (no animation)
+    /// x, y = top-left of cursor cell in pixels
+    pub fn snap(self: *CornerCursorAnimation, x: f32, y: f32, cell_width: f32, cell_height: f32) void {
+        const center_x = x + cell_width * 0.5;
+        const center_y = y + cell_height * 0.5;
+        self.destination = .{ center_x, center_y };
+        self.previous_destination = .{ center_x, center_y };
+        self.jumped = false;
+
         for (&self.corners) |*corner| {
-            corner.current = .{
-                self.target[0] + (corner.relative_pos[0] + 0.5) * cell_width,
-                self.target[1] + (corner.relative_pos[1] + 0.5) * cell_height,
-            };
-            corner.spring_x.reset();
-            corner.spring_y.reset();
-            corner.prev_dest = corner.current;
+            corner.current_position = corner.getDestination(self.destination, cell_width, cell_height);
+            corner.previous_destination = corner.current_position;
+            corner.animation_x.reset();
+            corner.animation_y.reset();
         }
+    }
+
+    /// Reset animation state (snap to current destination)
+    pub fn reset(self: *CornerCursorAnimation, cell_width: f32, cell_height: f32) void {
+        const x = self.destination[0] - cell_width * 0.5;
+        const y = self.destination[1] - cell_height * 0.5;
+        self.snap(x, y, cell_width, cell_height);
     }
 };
 

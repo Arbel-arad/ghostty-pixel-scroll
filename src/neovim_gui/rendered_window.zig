@@ -683,14 +683,28 @@ pub const RenderedWindow = struct {
 
         // Update scroll animation (Neovide-style)
         if (scroll_delta != 0) {
-            var scroll_offset = self.scroll_animation.position;
+            const current_pos = self.scroll_animation.position;
+            const delta_f: f32 = @floatFromInt(scroll_delta);
+            const new_delta = -delta_f; // scroll_delta > 0 -> position goes negative
+
+            // Check if continuing in same direction (accumulating)
+            // current_pos < 0 and new_delta < 0 = both scrolling down
+            // current_pos > 0 and new_delta > 0 = both scrolling up
+            const same_direction = (current_pos * new_delta) > 0;
+
+            var new_pos: f32 = undefined;
+            if (same_direction and @abs(current_pos) > 1.5) {
+                // Already behind and more input in same direction - cap accumulation
+                // Keep a small animation offset but don't let it grow unbounded
+                const sign: f32 = if (new_delta < 0) -1.0 else 1.0;
+                new_pos = sign * 2.0; // Cap at 2 lines worth of animation
+            } else {
+                // Normal case or direction change: accumulate/set
+                new_pos = current_pos + new_delta;
+            }
 
             const max_delta: f32 = @floatFromInt(inner_size);
-
-            scroll_offset -= @as(f32, @floatFromInt(scroll_delta));
-            scroll_offset = std.math.clamp(scroll_offset, -max_delta, max_delta);
-
-            self.scroll_animation.position = scroll_offset;
+            self.scroll_animation.position = std.math.clamp(new_pos, -max_delta, max_delta);
         }
     }
 
@@ -699,7 +713,17 @@ pub const RenderedWindow = struct {
         var animating = false;
 
         // Animate scroll using critically damped spring
-        if (self.scroll_animation.update(dt, self.scroll_settings.animation_length, 0)) {
+        // Use SHORTER animation when position is large (catching up from rapid scrolling)
+        const pos = @abs(self.scroll_animation.position);
+        const base_length = self.scroll_settings.animation_length;
+        // If more than 2 lines behind, use faster animation to catch up
+        // Scale: 2 lines = base_length, 4+ lines = base_length/3
+        const anim_length = if (pos > 2.0)
+            base_length / @min(pos / 2.0, 3.0)
+        else
+            base_length;
+
+        if (self.scroll_animation.update(dt, anim_length, 0)) {
             animating = true;
         }
 

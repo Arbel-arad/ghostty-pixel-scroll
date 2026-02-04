@@ -27,6 +27,12 @@ struct Uniforms {
   float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels
   float cursor_offset_x;  // Cursor animation X offset in pixels
   float cursor_offset_y;  // Cursor animation Y offset in pixels
+  // Neovide-style stretchy cursor - 4 corner positions (top-left, top-right, bottom-right, bottom-left)
+  float2 cursor_corner_tl;  // Top-left corner pixel position
+  float2 cursor_corner_tr;  // Top-right corner pixel position
+  float2 cursor_corner_br;  // Bottom-right corner pixel position
+  float2 cursor_corner_bl;  // Bottom-left corner pixel position
+  bool cursor_use_corners;  // Whether to use corner-based rendering
 };
 
 //-------------------------------------------------------------------
@@ -639,10 +645,31 @@ vertex CellTextVertexOut cell_text_vertex(
   // Apply global pixel scroll offset for smooth scrolling
   cell_pos.y -= uniforms.pixel_scroll_offset_y;
   
-  // Apply cursor animation offset if this is the cursor glyph
+  // Apply cursor animation for cursor glyph
   if ((in.bools & IS_CURSOR_GLYPH) != 0) {
-    cell_pos.x += uniforms.cursor_offset_x;
-    cell_pos.y += uniforms.cursor_offset_y;
+    if (uniforms.cursor_use_corners) {
+      // Neovide-style stretchy cursor: each vertex uses its animated corner position
+      // The corner_cursor animation provides absolute pixel positions for each corner.
+      // Vertex order in quad: vid 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+      // Corner order from Zig: [0]=TL, [1]=TR, [2]=BR, [3]=BL
+      float2 corner_pos;
+      if (vid == 0) {
+        corner_pos = uniforms.cursor_corner_tl;  // corners[0]
+      } else if (vid == 1) {
+        corner_pos = uniforms.cursor_corner_tr;  // corners[1]
+      } else if (vid == 2) {
+        corner_pos = uniforms.cursor_corner_bl;  // corners[3]
+      } else {
+        corner_pos = uniforms.cursor_corner_br;  // corners[2]
+      }
+      // corner_pos is already the final vertex position in pixels
+      // Just use it directly (no additional offset/size needed)
+      cell_pos = corner_pos;
+    } else {
+      // Simple offset-based animation (fallback)
+      cell_pos.x += uniforms.cursor_offset_x;
+      cell_pos.y += uniforms.cursor_offset_y;
+    }
   }
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);

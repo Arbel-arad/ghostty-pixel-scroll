@@ -206,6 +206,15 @@ pub const Uniforms = extern struct {
     cursor_offset_x: f32 align(4) = 0,
     cursor_offset_y: f32 align(4) = 0,
 
+    /// Neovide-style stretchy cursor - 4 corner positions in pixels
+    /// Order: top-left, top-right, bottom-right, bottom-left
+    cursor_corner_tl: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_tr: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_br: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_bl: [2]f32 align(8) = .{ 0, 0 },
+    /// Whether to use corner-based cursor rendering (as u32 for GLSL std140 alignment)
+    cursor_use_corners: u32 align(4) = 0,
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,

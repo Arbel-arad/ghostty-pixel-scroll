@@ -260,6 +260,15 @@ pub const Uniforms = extern struct {
     cursor_offset_x: f32 align(4) = 0,
     cursor_offset_y: f32 align(4) = 0,
 
+    /// Neovide-style stretchy cursor - 4 corner positions in pixels
+    /// Order: top-left, top-right, bottom-right, bottom-left
+    cursor_corner_tl: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_tr: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_br: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_bl: [2]f32 align(8) = .{ 0, 0 },
+    /// Whether to use corner-based cursor rendering
+    cursor_use_corners: bool align(1) = false,
+
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
         right: bool = false,

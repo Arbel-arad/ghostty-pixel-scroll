@@ -26,6 +26,12 @@ layout(binding = 1, std140) uniform Globals {
     uniform float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels (terminal scrollback)
     uniform float cursor_offset_x;  // Cursor animation X offset in pixels
     uniform float cursor_offset_y;  // Cursor animation Y offset in pixels
+    // Neovide-style stretchy cursor - 4 corner positions in pixels
+    uniform vec2 cursor_corner_tl;  // Top-left corner
+    uniform vec2 cursor_corner_tr;  // Top-right corner
+    uniform vec2 cursor_corner_br;  // Bottom-right corner
+    uniform vec2 cursor_corner_bl;  // Bottom-left corner
+    uniform uint cursor_use_corners;  // Whether to use corner-based rendering (as uint for alignment)
 };
 
 // Bools
