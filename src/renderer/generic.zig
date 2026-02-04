@@ -222,6 +222,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Scroll animation spring for smooth scrolling (position = offset in pixels from target)
         scroll_spring: animation.Spring = .{},
 
+        /// Target refresh rate for vsync timing (Hz)
+        target_refresh_rate: f64 = 60.0,
+
+        /// Last vsync time for frame pacing
+        last_vsync_time: ?std.time.Instant = null,
+
         /// Whether scroll animation is currently active
         scroll_animating: bool = false,
 
@@ -1492,45 +1498,55 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.last_frame_time = null;
                 return;
             };
-            const dt: f32 = if (self.last_frame_time) |last| blk: {
+            // Calculate frame delta time
+            const frame_dt: f32 = if (self.last_frame_time) |last| blk: {
                 if (now.order(last) == .lt) {
                     break :blk 1.0 / 60.0;
                 }
                 const ns: f32 = @floatFromInt(now.since(last));
-                break :blk @min(ns / std.time.ns_per_s, 0.1);
+                break :blk ns / std.time.ns_per_s;
             } else 1.0 / 60.0;
             self.last_frame_time = now;
 
             // Step 1: Process events FIRST (includes flush which updates scrollback and position)
             nvim.processEvents() catch {};
 
-            // Step 2: Animate (decay position toward 0)
-            var any_animating = false;
-            {
-                var window_iter = nvim.windows.valueIterator();
-                while (window_iter.next()) |window_ptr| {
-                    if (window_ptr.*.animate(dt)) {
-                        any_animating = true;
+            // Step 2: Animate with Neovide's subdivision approach
+            // Subdivide large dt values to prevent animation jumps from inconsistent frame timing
+            const MAX_ANIMATION_DT: f32 = 1.0 / 120.0; // 8.33ms max per animation step
+            const num_steps: u32 = @intFromFloat(@ceil(frame_dt / MAX_ANIMATION_DT));
+            const dt: f32 = frame_dt / @as(f32, @floatFromInt(num_steps));
+
+            // Run animation steps
+            var step: u32 = 0;
+            while (step < num_steps) : (step += 1) {
+                var any_animating = false;
+                {
+                    var window_iter = nvim.windows.valueIterator();
+                    while (window_iter.next()) |window_ptr| {
+                        if (window_ptr.*.animate(dt)) {
+                            any_animating = true;
+                        }
                     }
                 }
-            }
-            self.scroll_animating = any_animating;
+                self.scroll_animating = any_animating;
 
-            // Update cursor animations (Neovide-style)
-            // MUST be in same timing as scroll to stay in sync
-            // Always call update() unconditionally - it's cheap and ensures animations
-            // continue even if cursor_animating flag gets out of sync
-            {
-                const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                // Update cursor animations (Neovide-style)
+                // MUST be in same timing as scroll to stay in sync
+                // Always call update() unconditionally - it's cheap and ensures animations
+                // continue even if cursor_animating flag gets out of sync
+                {
+                    const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                    const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-                // 1. Update the floaty spring animation (smooth cursor center movement)
-                const floaty_animating = self.cursor_animation.update(dt, 0.13, 1.0);
+                    // 1. Update the floaty spring animation (smooth cursor center movement)
+                    const floaty_animating = self.cursor_animation.update(dt, 0.13, 1.0);
 
-                // 2. Update the stretchy corner animation
-                const corner_animating = self.corner_cursor.update(dt, cell_width, cell_height);
+                    // 2. Update the stretchy corner animation
+                    const corner_animating = self.corner_cursor.update(dt, cell_width, cell_height);
 
-                self.cursor_animating = floaty_animating or corner_animating;
+                    self.cursor_animating = floaty_animating or corner_animating;
+                }
             }
 
             // Step 3: Render with current position and updated scrollback

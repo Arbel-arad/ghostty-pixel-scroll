@@ -100,6 +100,34 @@ pub const GridLine = struct {
             self.cells[i].copyFrom(&cells[i]);
         }
     }
+
+    /// Resize the line width, preserving existing content where possible
+    /// Used to optimize nvim-tree animation (only width changes, not height)
+    pub fn resizeWidth(self: *GridLine, alloc: Allocator, new_width: u32) !void {
+        if (self.cells.len == new_width) return;
+
+        const old_cells = self.cells;
+        const old_width = old_cells.len;
+
+        // Allocate new cell array
+        const new_cells = try alloc.alloc(GridCell, new_width);
+
+        // Copy old content and initialize new cells
+        if (new_width > old_width) {
+            // Growing: copy all old cells, init new ones
+            @memcpy(new_cells[0..old_width], old_cells);
+            for (new_cells[old_width..]) |*cell| {
+                cell.* = GridCell{};
+            }
+        } else {
+            // Shrinking: copy what fits
+            @memcpy(new_cells, old_cells[0..new_width]);
+        }
+
+        // Free old array and update
+        alloc.free(old_cells);
+        self.cells = new_cells;
+    }
 };
 
 /// Ring buffer for efficient scrolling - O(1) rotation via index adjustment
@@ -308,6 +336,34 @@ pub const RenderedWindow = struct {
             width,
             height,
         });
+
+        // Optimization: if only width changed and height is the same, just resize existing lines
+        // This is common during nvim-tree animations (1x25 -> 2x25 -> 3x25 -> ...)
+        const height_unchanged = (height == self.grid_height and self.actual_lines != null);
+        if (height_unchanged) {
+            // Just resize each line's cell array
+            if (self.actual_lines) |*al| {
+                var i: u32 = 0;
+                while (i < height) : (i += 1) {
+                    if (al.getConst(@intCast(i))) |line| {
+                        line.resizeWidth(self.alloc, width) catch {};
+                    }
+                }
+            }
+            if (self.scrollback_lines) |*sb| {
+                var i: u32 = 0;
+                const sb_size = sb.length();
+                while (i < sb_size) : (i += 1) {
+                    const ptr = sb.get(@intCast(i));
+                    if (ptr.*) |line| {
+                        line.resizeWidth(self.alloc, width) catch {};
+                    }
+                }
+            }
+            self.grid_width = width;
+            self.dirty = true;
+            return;
+        }
 
         // Free old buffers
         if (self.actual_lines) |*al| {
@@ -698,6 +754,7 @@ pub const RenderedWindow = struct {
                 // Keep a small animation offset but don't let it grow unbounded
                 const sign: f32 = if (new_delta < 0) -1.0 else 1.0;
                 new_pos = sign * 2.0; // Cap at 2 lines worth of animation
+                log.err("SCROLL CAP TRIGGERED: delta={} current_pos={d:.2} -> capped to {d:.2}", .{ scroll_delta, current_pos, new_pos });
             } else {
                 // Normal case or direction change: accumulate/set
                 new_pos = current_pos + new_delta;
@@ -705,6 +762,10 @@ pub const RenderedWindow = struct {
 
             const max_delta: f32 = @floatFromInt(inner_size);
             self.scroll_animation.position = std.math.clamp(new_pos, -max_delta, max_delta);
+
+            if (@abs(current_pos) > 0.5) {
+                log.err("SCROLL BEHIND: delta={} current_pos={d:.2} new_pos={d:.2}", .{ scroll_delta, current_pos, new_pos });
+            }
         }
     }
 
@@ -725,6 +786,10 @@ pub const RenderedWindow = struct {
 
         if (self.scroll_animation.update(dt, anim_length, 0)) {
             animating = true;
+            // Log if scroll position is large (animation falling behind)
+            if (@abs(self.scroll_animation.position) > 1.0) {
+                log.err("SCROLL SLOW: pos={d:.2} anim_len={d:.3}s dt={d:.4}s", .{ self.scroll_animation.position, anim_length, dt });
+            }
         }
 
         // Window position: INSTANT (no animation)
