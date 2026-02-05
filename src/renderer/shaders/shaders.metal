@@ -457,15 +457,36 @@ fragment float4 bg_image_fragment(
 //-------------------------------------------------------------------
 #pragma mark - Cell BG Shader
 
+struct CellBgData {
+  uchar4 color;
+  short offset_y_fixed;  // 8.8 fixed point Y offset
+  uchar2 padding;
+};
+
 fragment float4 cell_bg_fragment(
   FullScreenVertexOut in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *cells [[buffer(2)]]
+  constant CellBgData *cells [[buffer(2)]]
 ) {
-  // Apply pixel scroll offset for smooth scrolling
+  // Apply global pixel scroll offset for smooth scrolling (terminal mode)
   float2 adjusted_pos = in.position.xy;
   adjusted_pos.y += uniforms.pixel_scroll_offset_y;
   int2 grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+  
+  // Apply per-cell offset for per-window smooth scrolling
+  if (grid_pos.x >= 0 && grid_pos.x < uniforms.grid_size.x &&
+      grid_pos.y >= 0 && grid_pos.y < uniforms.grid_size.y) {
+    int cell_index = grid_pos.y * uniforms.grid_size.x + grid_pos.x;
+    short per_cell_offset_fixed = cells[cell_index].offset_y_fixed;
+    
+    // Only apply offset to cells that have one (non-zero)
+    // Cells with offset=0 are statuslines/margins - they stay fixed and opaque
+    if (per_cell_offset_fixed != 0) {
+      float per_cell_offset_y = float(per_cell_offset_fixed) / 256.0;
+      adjusted_pos.y -= per_cell_offset_y;
+      grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+    }
+  }
 
   float4 bg = float4(0.0);
 
@@ -502,8 +523,12 @@ fragment float4 cell_bg_fragment(
     }
   }
 
-  // Load the color for the cell.
-  uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
+  // Load the color for the cell from the struct
+  uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x].color;
+  
+  // Force alpha to 255 - backgrounds should always be opaque
+  // This prevents transparency issues during smooth scrolling
+  cell_color.a = 255;
 
   // Convert the color and return it.
   //

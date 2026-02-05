@@ -90,7 +90,7 @@ pub const Contents = struct {
 
         const bg_cells = try alloc.alloc(shaderpkg.CellBg, cell_count);
         errdefer alloc.free(bg_cells);
-        @memset(bg_cells, .{ 0, 0, 0, 0 });
+        @memset(bg_cells, .{ .color = .{ 0, 0, 0, 0 }, .offset_y_fixed = 0 });
 
         // The foreground lists can hold 3 types of items:
         // - Glyphs
@@ -131,7 +131,7 @@ pub const Contents = struct {
 
     /// Reset the cell contents to an empty state without resizing.
     pub fn reset(self: *Contents) void {
-        @memset(self.bg_cells, .{ 0, 0, 0, 0 });
+        @memset(self.bg_cells, .{ .color = .{ 0, 0, 0, 0 }, .offset_y_fixed = 0 });
         self.fg_rows.reset();
     }
 
@@ -206,7 +206,7 @@ pub const Contents = struct {
     pub fn clear(self: *Contents, y: terminal.size.CellCountInt) void {
         assert(y < self.size.rows);
 
-        @memset(self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns], .{ 0, 0, 0, 0 });
+        @memset(self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns], .{ .color = .{ 0, 0, 0, 0 }, .offset_y_fixed = 0 });
 
         // We have a special list containing the cursor cell at the start
         // of our fg row collection, so we need to add 1 to the y to get

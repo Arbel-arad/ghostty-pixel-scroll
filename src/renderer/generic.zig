@@ -222,12 +222,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Scroll animation spring for smooth scrolling (position = offset in pixels from target)
         scroll_spring: animation.Spring = .{},
 
-        /// Target refresh rate for vsync timing (Hz)
-        target_refresh_rate: f64 = 60.0,
-
-        /// Last vsync time for frame pacing
-        last_vsync_time: ?std.time.Instant = null,
-
         /// Whether scroll animation is currently active
         scroll_animating: bool = false,
 
@@ -1514,7 +1508,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Step 2: Animate with Neovide's subdivision approach
             // Subdivide large dt values to prevent animation jumps from inconsistent frame timing
             const MAX_ANIMATION_DT: f32 = 1.0 / 120.0; // 8.33ms max per animation step
-            const num_steps: u32 = @intFromFloat(@ceil(frame_dt / MAX_ANIMATION_DT));
+            const num_steps: u32 = @max(1, @as(u32, @intFromFloat(@ceil(frame_dt / MAX_ANIMATION_DT))));
             const dt: f32 = frame_dt / @as(f32, @floatFromInt(num_steps));
 
             // Run animation steps
@@ -1553,6 +1547,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
+            // Don't use global pixel_scroll_offset_y for Neovim mode
+            // Each window has its own scroll animation handled via per-cell offsets
             self.uniforms.pixel_scroll_offset_y = 0;
 
             try self.rebuildCellsFromNeovim(nvim);
@@ -1598,7 +1594,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const bg_b: u8 = @intCast(default_bg & 0xFF);
             for (0..rows) |y| {
                 for (0..cols) |x| {
-                    self.cells.bgCell(y, x).* = .{ bg_r, bg_g, bg_b, 255 };
+                    self.cells.bgCell(y, x).* = .{
+                        .color = .{ bg_r, bg_g, bg_b, 255 },
+                        .offset_y_fixed = 0,
+                    };
                 }
             }
 
@@ -1743,7 +1742,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Get per-window scroll offset in pixels for smooth scrolling
                 // Only editor windows scroll - floating windows and messages don't
-                // Also skip scroll animation if scrollback doesn't have valid data (e.g., nvim-tree)
+                // Also skip scroll animation if scrollback doesn't have valid data
                 const has_valid_scrollback = if (!is_floating) window.hasValidScrollbackData() else false;
                 const scroll_pixel_offset: f32 = if (has_valid_scrollback)
                     window.getSubLineOffset(cell_h)
@@ -1785,12 +1784,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         // ALWAYS render backgrounds (painter's algorithm - later windows overwrite)
                         if (is_floating) {
-                            // Floating windows: solid background, no blending/transparency
+                            // Floating windows: solid background, no scroll offset
                             self.cells.bgCell(screen_y, screen_x).* = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                255,
+                                .color = .{
+                                    @intCast((bg_color >> 16) & 0xFF),
+                                    @intCast((bg_color >> 8) & 0xFF),
+                                    @intCast(bg_color & 0xFF),
+                                    255,
+                                },
+                                .offset_y_fixed = 0,
                             };
                         } else if (hl_attr.blend > 0) {
                             const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
@@ -1807,14 +1809,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
                             const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
 
-                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                .color = .{ final_r, final_g, final_b, 255 },
+                                .offset_y_fixed = 0, // Margins don't scroll
+                            };
                         } else {
                             // Solid background
                             self.cells.bgCell(screen_y, screen_x).* = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                255,
+                                .color = .{
+                                    @intCast((bg_color >> 16) & 0xFF),
+                                    @intCast((bg_color >> 8) & 0xFF),
+                                    @intCast(bg_color & 0xFF),
+                                    255,
+                                },
+                                .offset_y_fixed = 0, // Margins don't scroll
                             };
                         }
 
@@ -1829,8 +1837,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Render scrollable region
+                // Render extra row during scroll so content can scroll into view from below
+                const bg_offset_fixed: i16 = @intFromFloat(scroll_pixel_offset * 256.0);
+                const render_extra_row = (!is_floating and has_valid_scrollback and scroll_pixel_offset != 0);
+                const render_rows = if (render_extra_row) inner_size + 1 else inner_size;
                 var inner_row: u32 = 0;
-                while (inner_row < inner_size) : (inner_row += 1) {
+                while (inner_row < render_rows) : (inner_row += 1) {
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
                         // Screen position: margin_top + inner_row
@@ -1842,9 +1854,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         // Check if this window owns this cell for TEXT rendering
                         const owns_cell = occlusion_map[screen_y * cols + screen_x] == window.id;
+                        const is_extra_anim_row = (render_extra_row and inner_row == inner_size);
 
                         // For message windows, skip cells we don't own (empty cells)
-                        if (is_message_window and !owns_cell) continue;
+                        if (is_message_window and !owns_cell and !is_extra_anim_row) continue;
 
                         // Read from scrollback or actual_lines
                         const grid_cell = if (!is_floating and has_valid_scrollback)
@@ -1866,15 +1879,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             bg_color = tmp;
                         }
 
-                        // For floating windows: IGNORE blend, always use solid bg_color
-                        // This prevents "transparent" floating windows - they must be opaque
+                        // Floating windows: no scroll offset, solid background.
                         if (is_floating) {
-                            // Floating windows: solid background, no blending/transparency
                             self.cells.bgCell(screen_y, screen_x).* = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                255,
+                                .color = .{
+                                    @intCast((bg_color >> 16) & 0xFF),
+                                    @intCast((bg_color >> 8) & 0xFF),
+                                    @intCast(bg_color & 0xFF),
+                                    255,
+                                },
+                                .offset_y_fixed = 0,
                             };
                         } else if (hl_attr.blend > 0) {
                             const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
@@ -1891,31 +1905,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
                             const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
 
-                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
-                        } else {
-                            // Solid background
                             self.cells.bgCell(screen_y, screen_x).* = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                255,
+                                .color = .{ final_r, final_g, final_b, 255 },
+                                .offset_y_fixed = bg_offset_fixed,
+                            };
+                        } else {
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                .color = .{
+                                    @intCast((bg_color >> 16) & 0xFF),
+                                    @intCast((bg_color >> 8) & 0xFF),
+                                    @intCast(bg_color & 0xFF),
+                                    255,
+                                },
+                                .offset_y_fixed = bg_offset_fixed,
                             };
                         }
 
-                        // Only render TEXT if this window owns this cell (occlusion check)
-                        if (owns_cell) {
+                        // Only render TEXT if this window owns this cell or it's the extra animation row
+                        if (owns_cell or is_extra_anim_row) {
                             if (grid_cell) |cell| {
                                 const text = cell.getText();
                                 if (text.len > 0) {
-                                    // Don't apply scroll offset to edge rows to prevent bleeding
-                                    // into margins (bufferline at top, statusline at bottom)
-                                    const is_first_row = inner_row == 0;
-                                    const is_last_row = inner_row == inner_size - 1;
-                                    // Negative offset = content shifting UP, first row bleeds into top margin
-                                    // Positive offset = content shifting DOWN, last row bleeds into bottom margin
-                                    const skip_offset = (is_first_row and scroll_pixel_offset < 0 and margin_top > 0) or
-                                        (is_last_row and scroll_pixel_offset > 0 and margin_bottom > 0);
-                                    const effective_offset = if (skip_offset) 0 else scroll_pixel_offset;
+                                    const effective_offset: f32 = if (is_floating) 0 else scroll_pixel_offset;
                                     self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, effective_offset) catch {};
                                 }
                             }
@@ -1923,7 +1934,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
 
-                // Render bottom margin rows (statusline etc) - no scroll
+                // Render bottom margin rows (statusline etc) - no scroll, solid like floating
                 row = window.grid_height -| margin_bottom;
                 while (row < window.grid_height) : (row += 1) {
                     var col: u32 = 0;
@@ -1952,41 +1963,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             bg_color = tmp;
                         }
 
-                        // For floating windows: IGNORE blend, always use solid bg_color
-                        // This prevents "transparent" floating windows - they must be opaque
-                        if (is_floating) {
-                            // Floating windows: solid background, no blending/transparency
-                            self.cells.bgCell(screen_y, screen_x).* = .{
+                        // Bottom margin is always statusline - use solid background, no blend
+                        // This prevents transparency issues where scrolling content shows through
+                        self.cells.bgCell(screen_y, screen_x).* = .{
+                            .color = .{
                                 @intCast((bg_color >> 16) & 0xFF),
                                 @intCast((bg_color >> 8) & 0xFF),
                                 @intCast(bg_color & 0xFF),
                                 255,
-                            };
-                        } else if (hl_attr.blend > 0) {
-                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
-                            const inv_alpha = 255 - blend_alpha;
-
-                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
-                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
-                            const cell_b: u16 = @intCast(bg_color & 0xFF);
-                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
-                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
-                            const def_b: u16 = @intCast(default_bg & 0xFF);
-
-                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
-                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
-                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
-
-                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
-                        } else {
-                            // Solid background
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                255,
-                            };
-                        }
+                            },
+                            .offset_y_fixed = 0,
+                        };
 
                         // Only render TEXT if this window owns this cell (occlusion check)
                         if (owns_cell) {
@@ -2032,26 +2019,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (screen_row >= self.cells.size.rows or screen_col >= self.cells.size.columns) return;
 
-            // Set cursor position in uniforms (integer position for cell lookup)
-            self.uniforms.cursor_pos = .{ screen_col, screen_row };
+            // Don't set cursor_pos for Neovim mode - we use animated cursor rendering instead
+            // Setting cursor_pos would cause the shader to draw a non-animated cursor at the actual position
+            // which creates a "black thing" that lags behind the animated cursor
+            self.uniforms.cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
 
             // Pixel positions (top-left of cursor cell) - includes scroll offset
             // This is the cursor's TARGET position that it animates toward
             const target_pixel_x: f32 = grid_x * cell_width;
             const target_pixel_y: f32 = grid_y * cell_height;
 
-            // Neovide-style: ALWAYS animate cursor, even during scroll
-            // The cursor destination moves with scroll, and corners animate toward it
+            // Neovide-style cursor animation
+            // The cursor should animate smoothly when either:
+            // 1. Cursor grid position changes (normal movement)
+            // 2. Scroll position changes (cursor follows content)
+
             const last_x = self.last_cursor_grid_pos[0];
             const last_y = self.last_cursor_grid_pos[1];
-            const last_scroll = self.last_cursor_scroll_pos;
+            const scroll_changed = scroll_pos != self.last_cursor_scroll_pos;
+            const pos_changed = screen_col != last_x or screen_row != last_y;
 
-            // Detect if cursor grid position changed OR scroll position changed
-            if (screen_col != last_x or screen_row != last_y or scroll_pos != last_scroll) {
-                // Position changed - set new target for BOTH animations:
-                // 1. Floaty spring animation (smooth center movement)
+            if (pos_changed or scroll_changed) {
+                // Set new target - target_pixel_y already includes scroll offset
                 self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
-                // 2. Stretchy corner animation (uses animated position from floaty spring)
                 self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
 
                 self.last_cursor_grid_pos = .{ screen_col, screen_row };
@@ -3890,7 +3880,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
 
                     self.cells.bgCell(y, x).* = .{
-                        rgb.r, rgb.g, rgb.b, bg_alpha,
+                        .color = .{ rgb.r, rgb.g, rgb.b, bg_alpha },
+                        .offset_y_fixed = 0,
                     };
                 }
 
@@ -4327,11 +4318,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Add our opaque background cell
             self.cells.bgCell(coord.y, coord.x).* = .{
-                screen_bg.r, screen_bg.g, screen_bg.b, 255,
+                .color = .{ screen_bg.r, screen_bg.g, screen_bg.b, 255 },
+                .offset_y_fixed = 0,
             };
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 self.cells.bgCell(coord.y, coord.x + 1).* = .{
-                    screen_bg.r, screen_bg.g, screen_bg.b, 255,
+                    .color = .{ screen_bg.r, screen_bg.g, screen_bg.b, 255 },
+                    .offset_y_fixed = 0,
                 };
             }
 

@@ -6,8 +6,14 @@ layout(origin_upper_left) in vec4 gl_FragCoord;
 // Must declare this output for some versions of OpenGL.
 layout(location = 0) out vec4 out_FragColor;
 
+struct CellBgData {
+    uint color;           // Packed RGBA (4 bytes)
+    int offset_y_fixed;   // 8.8 fixed point Y offset stored in lower 16 bits
+    // Note: GLSL doesn't have short/ushort, so we use int but only read lower 16 bits
+};
+
 layout(binding = 1, std430) readonly buffer bg_cells {
-    uint cells[];
+    CellBgData cells[];
 };
 
 vec4 cell_bg() {
@@ -15,11 +21,27 @@ vec4 cell_bg() {
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     
     // Calculate grid position from fragment coordinates
-    // NOTE: Scroll offset is NOT applied here - it's handled per-window in the CPU
-    // by adjusting glyph positions. Backgrounds are rendered at final positions.
     vec2 adjusted_coord = gl_FragCoord.xy;
+    adjusted_coord.y += pixel_scroll_offset_y; // Global scroll offset (terminal mode)
     
     ivec2 grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+    
+    // Apply per-cell offset for per-window smooth scrolling
+    if (grid_pos.x >= 0 && grid_pos.x < int(grid_size.x) &&
+        grid_pos.y >= 0 && grid_pos.y < int(grid_size.y)) {
+        int cell_index = grid_pos.y * int(grid_size.x) + grid_pos.x;
+        // Read offset as int, but it's stored as i16 in lower 16 bits - sign extend it
+        int offset_raw = cells[cell_index].offset_y_fixed;
+        int offset_i16 = (offset_raw << 16) >> 16; // Sign extend from 16-bit to 32-bit
+        
+        // Only apply offset to cells that have one (non-zero)
+        // Cells with offset=0 are statuslines/margins - they stay fixed and opaque
+        if (offset_i16 != 0) {
+            float per_cell_offset_y = float(offset_i16) / 256.0;
+            adjusted_coord.y -= per_cell_offset_y;
+            grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        }
+    }
 
     vec4 bg = vec4(0.0);
 
@@ -53,14 +75,11 @@ vec4 cell_bg() {
         }
     }
 
-    // Load the color for the cell.
-    vec4 cell_color = load_color(
-            unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x]),
-            use_linear_blending
-        );
-
-    // Force full opacity for debug
-    cell_color.a = 1.0;
+    // Load the color for the cell from the struct
+    // Force alpha to 255 BEFORE load_color to prevent premultiplied alpha issues
+    uvec4 raw_color = unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x].color);
+    raw_color.a = 255u;  // Force full opacity before premultiplication
+    vec4 cell_color = load_color(raw_color, use_linear_blending);
 
     return cell_color;
 }

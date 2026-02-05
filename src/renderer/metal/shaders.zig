@@ -309,7 +309,14 @@ pub const CellText = extern struct {
 };
 
 /// This is a single parameter for the cell bg shader.
-pub const CellBg = [4]u8;
+/// Includes per-cell Y offset for smooth background scrolling (Neovim cursorline, etc.)
+pub const CellBg = extern struct {
+    color: [4]u8,
+    /// Per-cell Y offset in pixels for smooth scrolling
+    /// Stored as 8.8 fixed point (i16): value = pixels * 256
+    offset_y_fixed: i16 = 0,
+    _padding: [2]u8 = .{ 0, 0 }, // Align to 8 bytes for GPU buffer
+};
 
 /// Single parameter for the image shader. See shader for field details.
 pub const Image = extern struct {
