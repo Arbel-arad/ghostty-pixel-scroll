@@ -92,6 +92,12 @@ void main() {
     // Apply global pixel scroll offset (base grid alignment)
     // In terminal mode: shifts content up to hide an extra row for smooth scrollback.
     cell_pos.y -= pixel_scroll_offset_y;
+
+    // Snap text glyph Y position to nearest integer pixel to prevent shimmer/blur
+    // during smooth scrolling. Backgrounds still scroll at sub-pixel precision for
+    // visual smoothness, but text must be pixel-aligned since glyph atlases use
+    // nearest-neighbor sampling and were rasterized at integer positions.
+    cell_pos.y = round(cell_pos.y);
     
     // Apply cursor animation offset if this is the cursor glyph
     if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {

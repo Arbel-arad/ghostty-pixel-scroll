@@ -684,6 +684,12 @@ vertex CellTextVertexOut cell_text_vertex(
   
   // Apply global pixel scroll offset for smooth scrolling
   cell_pos.y -= uniforms.pixel_scroll_offset_y;
+
+  // Snap text glyph Y position to nearest integer pixel to prevent shimmer/blur
+  // during smooth scrolling. Backgrounds still scroll at sub-pixel precision for
+  // visual smoothness, but text must be pixel-aligned since glyph atlases use
+  // nearest-neighbor sampling and were rasterized at integer positions.
+  cell_pos.y = round(cell_pos.y);
   
   // Apply cursor animation for cursor glyph
   if ((in.bools & IS_CURSOR_GLYPH) != 0) {

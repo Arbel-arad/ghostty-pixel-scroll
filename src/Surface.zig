@@ -5124,6 +5124,36 @@ pub fn cursorPosCallback(
         return;
     }
 
+    // In Neovim GUI mode, forward mouse motion/drag to Neovim and skip terminal selection.
+    // Without this, drag events fall into terminal selection code that dereferences
+    // left_click_pin which is never set in Neovim GUI mode, causing a crash.
+    if (self.nvim_gui) |nvim| {
+        if (nvim.mouse_enabled) {
+            // Check if any button is pressed (drag) or just motion
+            const left_pressed = self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press;
+            const right_pressed = self.mouse.click_state[@intFromEnum(input.MouseButton.right)] == .press;
+            const middle_pressed = self.mouse.click_state[@intFromEnum(input.MouseButton.middle)] == .press;
+
+            if (left_pressed or right_pressed or middle_pressed) {
+                const nvim_button: []const u8 = if (left_pressed) "left" else if (right_pressed) "right" else "middle";
+                const nvim_mods = neovim_gui.nvim_input.toNeovimMouseMods(self.mouse.mods);
+
+                const cell_w: f64 = @floatFromInt(self.size.cell.width);
+                const cell_h: f64 = @floatFromInt(self.size.cell.height);
+                const screen_col: f32 = @floatCast(@max(0, pos.x) / cell_w);
+                const screen_row: f32 = @floatCast(@max(0, pos.y) / cell_h);
+
+                if (nvim.findWindowAtPosition(screen_col, screen_row)) |window_info| {
+                    try nvim.sendMouse(nvim_button, "drag", nvim_mods, window_info.grid_id, window_info.row, window_info.col);
+                } else {
+                    try nvim.sendMouse(nvim_button, "drag", nvim_mods, 0, @intFromFloat(screen_row), @intFromFloat(screen_col));
+                }
+                try self.queueRender();
+            }
+        }
+        return;
+    }
+
     // Handle cursor position for text selection
     if (self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press) select: {
         // Left click pressed but count zero can happen if mouse reporting is on.

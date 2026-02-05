@@ -1254,6 +1254,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
                 tui_in_alternate: bool,
+                viewport_at_bottom: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1347,6 +1348,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 state.mouse.scroll_delta_lines = 0;
 
                 const tui_in_alternate = state.terminal.screens.active_key == .alternate;
+                const viewport_at_bottom = state.terminal.screens.active.viewportIsBottom();
 
                 break :critical .{
                     .links = links,
@@ -1355,6 +1357,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                     .tui_in_alternate = tui_in_alternate,
+                    .viewport_at_bottom = viewport_at_bottom,
                 };
             };
 
@@ -1464,21 +1467,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scrollbar_dirty = true;
                 }
 
-                // Update scroll animation state
-                // When terminal viewport scrolls by N lines, we get scroll_delta_lines
-                // We set the spring to animate from that offset back to 0
+                // Update scroll animation state for large content drops.
+                // Only trigger the spring animation when:
+                // 1. The viewport is at the bottom (new content pushing, not user scrolling history)
+                // 2. The scroll jump exceeds a threshold (large output, not single lines)
+                // 3. Not in alternate screen (TUI apps handle their own rendering)
+                // This prevents the spring from interfering with mouse/trackpad scrolling
+                // which already has its own smooth pixel offset handling.
+                const scroll_jump = self.terminal_state.scroll_jump;
+                const scroll_threshold: f32 = 4.0; // Minimum lines to trigger spring animation
+                if (@abs(scroll_jump) >= scroll_threshold and
+                    critical.viewport_at_bottom and
+                    !self.in_alternate_screen)
+                {
+                    const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    // scroll_jump > 0 means viewport moved DOWN (content scrolled up, e.g. new output)
+                    // Spring position = pixel offset from target (0 = at target).
+                    // Set position to scroll_jump * cell_h so content appears to slide from old pos.
+                    self.scroll_spring.position += scroll_jump * cell_h;
+                    self.scroll_animating = true;
+                }
+                // Reset scroll_jump so we don't re-apply it next frame
+                self.terminal_state.scroll_jump = 0;
 
-                // Scroll jumps (keyboard scrolling in terminal)
-                // NOTE: We currently disable spring animation for scroll jumps
-                // because it causes edge bounce. The content has already jumped
-                // to the new position, and trying to animate the visual offset
-                // makes the top/bottom edges move, which looks bad.
-                //
-                // For proper smooth scroll we'd need frame capture + crossfade.
-                // For now, scroll_jump is ignored for animation purposes.
-                // (Terminal scrollback with mouse/trackpad still works smoothly)
-
-                // Store the sub-line pixel offset
+                // Store the sub-line pixel offset (from mouse/trackpad)
                 self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
 
                 // Track alternate screen state - this determines whether to apply
@@ -2474,6 +2486,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // along with event processing, so they stay perfectly in sync (like Neovide).
             // We don't duplicate animation updates here to avoid race conditions.
 
+            // Update terminal scroll spring animation (not for Neovim GUI mode)
+            if (self.nvim_gui == null and self.scroll_animating) {
+                const scroll_len = self.config.scroll_animation_duration;
+                const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
+                self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
+            }
+
             // Pixel scroll offset for smooth scrolling
             //
             // For terminal scrollback (mouse/trackpad): Use sub-cell pixel offset
@@ -2500,7 +2519,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 else
                     // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
                     cell_h - self.scroll_pixel_offset;
-                self.uniforms.pixel_scroll_offset_y = base_offset;
+
+                // Add spring animation offset for smooth content-arrival scrolling.
+                // scroll_spring.position is positive when content just scrolled up (new output),
+                // meaning we need to shift content DOWN to show it sliding up into place.
+                // As the spring decays to 0, the offset vanishes and content reaches its final position.
+                const spring_offset = self.scroll_spring.position;
+                self.uniforms.pixel_scroll_offset_y = base_offset - spring_offset;
             }
 
             // After the graphics API is complete (so we defer) we want to
