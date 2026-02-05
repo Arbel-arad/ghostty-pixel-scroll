@@ -76,6 +76,9 @@ pub const NeovimGui = struct {
     /// Dirty flag - something changed and needs render
     dirty: bool = true,
 
+    /// Composition order for floating windows (used when compindex is not provided)
+    composition_order: u64 = 0,
+
     /// Opaque pointer to renderer wakeup (xev.Async) for zero-latency wakeup
     render_wakeup_ptr: ?*anyopaque = null,
     /// Function to call notify on the wakeup
@@ -789,7 +792,7 @@ pub const NeovimGui = struct {
                 start_row,
             });
 
-            window.setFloatPosition(start_row, start_col, pending.zindex);
+            window.setFloatPosition(start_row, start_col, pending.zindex, pending.compindex);
             window.window_type = .floating;
 
             // Clear pending anchor - we've processed it
@@ -849,12 +852,20 @@ pub const NeovimGui = struct {
     fn handleWinPos(self: *Self, data: Event.WinPos) !void {
         const window = try self.getOrCreateWindow(data.grid);
         window.setPosition(data.start_row, data.start_col, data.width, data.height);
-        window.window_type = .editor;
         self.dirty = true;
     }
 
     fn handleWinFloatPos(self: *Self, data: Event.WinFloatPos) !void {
         const window = try self.getOrCreateWindow(data.grid);
+
+        // Determine composition order (compindex) for stable float layering
+        const compindex: u64 = if (data.compindex) |ci| ci else blk: {
+            if (window.zindex == data.zindex and window.composition_order != 0) {
+                break :blk window.composition_order;
+            }
+            self.composition_order += 1;
+            break :blk self.composition_order;
+        };
 
         // Get parent window position (anchor grid)
         const parent_pos: [2]f32 = if (self.windows.get(data.anchor_grid)) |parent|
@@ -910,6 +921,7 @@ pub const NeovimGui = struct {
                 .anchor_row = data.anchor_row,
                 .anchor_col = data.anchor_col,
                 .zindex = data.zindex,
+                .compindex = compindex,
             };
             log.info("handleWinFloatPos: grid={} has no size yet, storing pending_anchor", .{data.grid});
         } else {
@@ -917,7 +929,7 @@ pub const NeovimGui = struct {
             window.pending_anchor = null;
         }
 
-        window.setFloatPosition(start_row, start_col, data.zindex);
+        window.setFloatPosition(start_row, start_col, data.zindex, compindex);
         window.window_type = .floating;
         self.dirty = true;
     }
@@ -979,7 +991,15 @@ pub const NeovimGui = struct {
             self.grid_width;
 
         // Use the new setMessagePosition method which sets anchor_info
-        window.setMessagePosition(data.row, data.zindex, parent_width);
+        const compindex: u64 = if (data.compindex) |ci| ci else blk: {
+            if (window.zindex == data.zindex and window.composition_order != 0) {
+                break :blk window.composition_order;
+            }
+            self.composition_order += 1;
+            break :blk self.composition_order;
+        };
+
+        window.setMessagePosition(data.row, data.zindex, compindex, parent_width);
         self.dirty = true;
 
         log.info("handleMsgSetPos DONE: grid={} row={} zindex={} parent_width={} final_pos=({d:.1},{d:.1})", .{
@@ -1162,10 +1182,16 @@ pub const NeovimGui = struct {
             }
         }
 
-        // Sort floating windows by zindex (highest first)
+        // Sort floating windows by zindex, then composition order (highest first)
         const FloatingEntry = @TypeOf(floating_windows[0]);
         const sortFn = struct {
             fn lessThan(_: void, a: FloatingEntry, b: FloatingEntry) bool {
+                if (a.window.zindex == b.window.zindex) {
+                    if (a.window.composition_order == b.window.composition_order) {
+                        return a.window.id > b.window.id;
+                    }
+                    return a.window.composition_order > b.window.composition_order;
+                }
                 return a.window.zindex > b.window.zindex;
             }
         }.lessThan;

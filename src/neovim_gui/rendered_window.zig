@@ -230,6 +230,7 @@ pub const PendingAnchor = struct {
     anchor_row: f32,
     anchor_col: f32,
     zindex: u64,
+    compindex: u64,
 };
 
 /// Viewport margins - fixed rows/cols that don't scroll (winbar, borders, etc.)
@@ -296,6 +297,8 @@ pub const RenderedWindow = struct {
 
     /// Z-index for floating windows (higher = on top)
     zindex: u64 = 0,
+    /// Composition order for floating windows (higher = on top within same zindex)
+    composition_order: u64 = 0,
 
     /// Anchor info - if not null, this is a floating window
     anchor_info: ?AnchorInfo = null,
@@ -549,12 +552,13 @@ pub const RenderedWindow = struct {
         // Only reset if this is being set as a docked window (zindex was 0)
         if (self.window_type != .floating and self.window_type != .message) {
             self.zindex = 0;
+            self.composition_order = 0;
             self.anchor_info = null;
             self.window_type = .editor;
         }
     }
 
-    pub fn setFloatPosition(self: *Self, row: u64, col: u64, zindex: u64) void {
+    pub fn setFloatPosition(self: *Self, row: u64, col: u64, zindex: u64, compindex: u64) void {
         const new_x: f32 = @floatFromInt(col);
         const new_y: f32 = @floatFromInt(row);
 
@@ -567,6 +571,7 @@ pub const RenderedWindow = struct {
         self.hidden = false;
         self.has_position = true; // Floating windows have positions too!
         self.zindex = zindex;
+        self.composition_order = compindex;
         self.window_type = .floating;
         self.anchor_info = .{
             .anchor_grid_id = 1,
@@ -576,7 +581,7 @@ pub const RenderedWindow = struct {
         };
     }
 
-    pub fn setMessagePosition(self: *Self, row: u64, zindex: u64, parent_width: u32) void {
+    pub fn setMessagePosition(self: *Self, row: u64, zindex: u64, compindex: u64, parent_width: u32) void {
         _ = parent_width;
         const new_y: f32 = @floatFromInt(row);
 
@@ -589,6 +594,7 @@ pub const RenderedWindow = struct {
         self.hidden = false;
         self.has_position = true; // Message windows have positions too!
         self.zindex = zindex;
+        self.composition_order = compindex;
         self.window_type = .message;
         self.anchor_info = .{
             .anchor_grid_id = 1,

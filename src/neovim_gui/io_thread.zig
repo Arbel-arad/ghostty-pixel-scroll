@@ -234,6 +234,7 @@ pub const Event = union(enum) {
         anchor_col: f32,
         focusable: bool,
         zindex: u64,
+        compindex: ?u64,
 
         pub const Anchor = enum {
             NW, // top-left
@@ -260,6 +261,7 @@ pub const Event = union(enum) {
         row: u64,
         scrolled: bool,
         zindex: u64,
+        compindex: ?u64,
     };
 
     pub const HlAttrDefine = struct {
@@ -1202,6 +1204,7 @@ pub const IoThread = struct {
                 // Window handle is often an ext type (window handle) that we can't easily parse
                 const win = extractU64(args[1]) orelse grid;
                 const zindex = extractU64(args[7]) orelse 50;
+                const compindex: ?u64 = if (args.len >= 9) extractU64(args[8]) else null;
 
                 // Try to use screen_row/screen_col if available (args[9] and args[10])
                 // These are the pre-calculated screen positions from Neovim
@@ -1233,6 +1236,7 @@ pub const IoThread = struct {
                             .anchor_col = screen_col,
                             .focusable = extractBool(args[6]),
                             .zindex = zindex,
+                            .compindex = compindex,
                         },
                     });
                 } else {
@@ -1267,6 +1271,7 @@ pub const IoThread = struct {
                         .anchor_col = anchor_col,
                         .focusable = extractBool(args[6]),
                         .zindex = zindex,
+                        .compindex = compindex,
                     } });
                 }
             } else {
@@ -1313,12 +1318,14 @@ pub const IoThread = struct {
                 const row = extractU64(args[1]) orelse return;
                 const scrolled = extractBool(args[2]);
                 const zindex = if (args.len >= 5) extractU64(args[4]) orelse 200 else 200;
-                log.info("msg_set_pos: grid={} row={} scrolled={} zindex={}", .{ grid, row, scrolled, zindex });
+                const compindex: ?u64 = if (args.len >= 6) extractU64(args[5]) else null;
+                log.info("msg_set_pos: grid={} row={} scrolled={} zindex={} compindex={any}", .{ grid, row, scrolled, zindex, compindex });
                 try self.event_queue.push(.{ .msg_set_pos = .{
                     .grid = grid,
                     .row = row,
                     .scrolled = scrolled,
                     .zindex = zindex,
+                    .compindex = compindex,
                 } });
             }
         } else if (std.mem.eql(u8, name, "hl_attr_define")) {

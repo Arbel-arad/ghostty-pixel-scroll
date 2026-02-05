@@ -1713,9 +1713,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Sort floating windows by z-index (lower first, so higher z-index renders on top)
+            // Sort floating windows by z-index then composition order (lower first, so higher renders on top)
             std.mem.sort(*neovim_gui.RenderedWindow, floating_windows.items, {}, struct {
                 fn lessThan(_: void, a: *neovim_gui.RenderedWindow, b: *neovim_gui.RenderedWindow) bool {
+                    if (a.zindex == b.zindex) {
+                        if (a.composition_order == b.composition_order) {
+                            return a.id < b.id;
+                        }
+                        return a.composition_order < b.composition_order;
+                    }
                     return a.zindex < b.zindex;
                 }
             }.lessThan);
@@ -1765,16 +1771,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 });
             }
             for (floating_windows.items) |w| {
-                log.debug("  floating window: grid={} pos=({},{}) size={}x{} zindex={} type={s} has_lines={}", .{
+                log.debug("  floating window: grid={} pos=({},{}) size={}x{} zindex={} compindex={} type={s} has_lines={}", .{
                     w.id,
                     @as(i32, @intFromFloat(w.grid_position[0])),
                     @as(i32, @intFromFloat(w.grid_position[1])),
                     w.grid_width,
                     w.grid_height,
                     w.zindex,
+                    w.composition_order,
                     @tagName(w.window_type),
                     w.actual_lines != null,
                 });
+            }
+
+            // Track which window ids are floating/message for occlusion decisions
+            var floating_ids = std.AutoHashMap(u64, void).init(self.alloc);
+            defer floating_ids.deinit();
+            for (windows_to_render.items) |w| {
+                const is_floating = w.zindex > 0 or w.window_type == .floating or w.window_type == .message;
+                if (is_floating) {
+                    floating_ids.put(w.id, {}) catch {};
+                }
             }
 
             // RENDERING STRATEGY:
@@ -1816,6 +1833,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Get margins for this window to skip border/margin cells in occlusion
                 const margin_top = window.viewport_margins.top;
                 const margin_bottom = window.viewport_margins.bottom;
+                const margin_left = window.viewport_margins.left;
+                const margin_right = window.viewport_margins.right;
 
                 var py: u32 = 0;
                 while (py < render_height) : (py += 1) {
@@ -1828,7 +1847,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 // Skip margin rows - they only have backgrounds, no text
                                 // This prevents floating window borders from blocking text below
                                 const is_margin_row = py < margin_top or py >= (render_height -| margin_bottom);
-                                if (is_margin_row) continue;
+                                const is_margin_col = px < margin_left or px >= (render_width -| margin_right);
+                                if (is_margin_row or is_margin_col) continue;
 
                                 // Message windows only claim cells with actual content
                                 if (is_message) {
@@ -1886,7 +1906,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
                         // Check if this window owns this cell for TEXT rendering
-                        const owns_cell = occlusion_map[screen_y * cols + screen_x] == window.id;
+                        const owner = occlusion_map[screen_y * cols + screen_x];
+                        var owns_cell = owner == window.id;
+                        if (is_floating and !owns_cell) {
+                            // Floating windows should render over root windows even if occlusion claims root.
+                            if (owner == 0 or !floating_ids.contains(owner)) {
+                                owns_cell = true;
+                            }
+                        }
 
                         // For message windows, skip cells we don't own (empty cells)
                         if (is_message_window and !owns_cell) continue;
@@ -1985,7 +2012,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
                         // Check if this window owns this cell for TEXT rendering
-                        const owns_cell = occlusion_map[screen_y * cols + screen_x] == window.id;
+                        const owner = occlusion_map[screen_y * cols + screen_x];
+                        var owns_cell = owner == window.id;
+                        if (is_floating and !owns_cell) {
+                            if (owner == 0 or !floating_ids.contains(owner)) {
+                                owns_cell = true;
+                            }
+                        }
 
                         // For extra animation row: only draw if we own the cell OR no one owns it (unclaimed)
                         // This prevents drawing over statusline which is a separate window
@@ -2084,7 +2117,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
                         // Check if this window owns this cell for TEXT rendering
-                        const owns_cell = occlusion_map[screen_y * cols + screen_x] == window.id;
+                        const owner = occlusion_map[screen_y * cols + screen_x];
+                        var owns_cell = owner == window.id;
+                        if (is_floating and !owns_cell) {
+                            if (owner == 0 or !floating_ids.contains(owner)) {
+                                owns_cell = true;
+                            }
+                        }
 
                         // For message windows, skip cells we don't own (empty cells)
                         if (is_message_window and !owns_cell) continue;
