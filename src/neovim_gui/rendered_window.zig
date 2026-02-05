@@ -251,12 +251,27 @@ pub const RenderedWindow = struct {
     valid: bool = false,
     hidden: bool = false,
 
+    /// Whether this window has received a win_pos event
+    /// Windows without position should not be rendered (except grid 1)
+    has_position: bool = false,
+
+    /// After resize, we need to receive content before rendering
+    /// This prevents black flashes when scrollback is populated with empty lines
+    needs_content: bool = false,
+
     /// Window type
     window_type: WindowType = .editor,
 
-    /// Grid dimensions
+    /// Grid dimensions (buffer size - from grid_resize)
     grid_width: u32 = 0,
     grid_height: u32 = 0,
+
+    /// Display dimensions (from win_pos - may differ from grid dimensions during resize)
+    /// These are the dimensions we should use for RENDERING, as they reflect the
+    /// actual visible area reported by Neovim. This fixes artifacts during resize
+    /// animations where win_pos arrives before grid_resize.
+    display_width: u32 = 0,
+    display_height: u32 = 0,
 
     /// Position in grid coordinates (col, row)
     grid_position: [2]f32 = .{ 0, 0 },
@@ -341,10 +356,20 @@ pub const RenderedWindow = struct {
             height,
         });
 
+        // Grid 1 is special - it's the outer container with statusline/cmdline at the bottom.
+        // Don't preserve content for grid 1 since positions change completely on resize.
+        // Also don't preserve if we have no old content to preserve.
+        // Also don't preserve if width is SHRINKING - this causes color bleeding artifacts
+        // from statusline/tabline highlights that extend to the window edge.
+        const width_shrinking = (self.grid_width > 0) and (width < self.grid_width);
+        const should_preserve = (self.id != 1) and (self.actual_lines != null) and (self.grid_height > 0) and !width_shrinking;
+
         // Optimization: if only width changed and height is the same, just resize existing lines
         // This is common during nvim-tree animations (1x25 -> 2x25 -> 3x25 -> ...)
+        // Only use this fast path when GROWING - shrinking can cause color artifacts
         const height_unchanged = (height == self.grid_height and self.actual_lines != null);
-        if (height_unchanged) {
+        const width_growing = (width > self.grid_width);
+        if (height_unchanged and width_growing) {
             // Just resize each line's cell array
             if (self.actual_lines) |*al| {
                 var i: u32 = 0;
@@ -369,58 +394,82 @@ pub const RenderedWindow = struct {
             return;
         }
 
-        // Free old buffers
-        if (self.actual_lines) |*al| {
-            al.deinit();
-        }
-        if (self.scrollback_lines) |*sb| {
-            sb.deinit();
-        }
+        // Preserve old content during resize to prevent black flashes
+        // This is critical for smooth animations (hy3 layout changes, nvim-tree, etc.)
+        // But NOT for grid 1 (outer container) where statusline position changes
+        const old_actual = if (should_preserve) self.actual_lines else null;
+        const old_scrollback = self.scrollback_lines;
+        const old_width = if (should_preserve) self.grid_width else 0;
+        const old_height = if (should_preserve) self.grid_height else 0;
 
-        // Allocate actual_lines (viewport height)
-        self.actual_lines = try RingBuffer(?*GridLine).init(self.alloc, height);
+        // Allocate new actual_lines (viewport height)
+        var new_actual = try RingBuffer(?*GridLine).init(self.alloc, height);
+        errdefer new_actual.deinit();
 
-        // Initialize actual_lines with new GridLine objects
+        // Initialize actual_lines with new GridLine objects, copying old content where possible
         var i: u32 = 0;
         while (i < height) : (i += 1) {
             const line = try GridLine.init(self.alloc, width);
-            self.actual_lines.?.set(@intCast(i), line);
+            // Copy content from old buffer if available (only for non-grid1 windows)
+            if (old_actual != null and i < old_height) {
+                if (old_actual.?.getConst(@intCast(i))) |old_line| {
+                    const copy_width = @min(width, old_width);
+                    var col: u32 = 0;
+                    while (col < copy_width) : (col += 1) {
+                        line.cells[col].copyFrom(&old_line.cells[col]);
+                    }
+                }
+            }
+            new_actual.set(@intCast(i), line);
         }
 
         // Allocate scrollback (2x viewport height)
         const scrollback_size = height * 2;
-        self.scrollback_lines = try RingBuffer(?*GridLine).init(self.alloc, scrollback_size);
+        var new_scrollback = try RingBuffer(?*GridLine).init(self.alloc, scrollback_size);
+        errdefer new_scrollback.deinit();
 
-        // Initialize scrollback - populate BOTH halves with the same content
-        // This ensures negative indices (scroll down) have valid data immediately
-        // First half: scrollback[0..height]
-        // Second half: scrollback[height..2*height] (for negative index wrapping)
+        // Initialize scrollback with content from actual_lines
         i = 0;
         while (i < height) : (i += 1) {
             const line = try GridLine.init(self.alloc, width);
-            // Copy from actual_lines
-            if (self.actual_lines.?.getConst(@intCast(i))) |src| {
+            // Copy from new actual_lines
+            if (new_actual.getConst(@intCast(i))) |src| {
                 line.copyFromSlice(src.cells);
             }
-            self.scrollback_lines.?.set(@intCast(i), line);
+            new_scrollback.set(@intCast(i), line);
         }
         // Populate second half with same content (for scroll down support)
         while (i < scrollback_size) : (i += 1) {
             const line = try GridLine.init(self.alloc, width);
             // Copy from corresponding position in first half
             const src_idx = i - height;
-            if (self.actual_lines.?.getConst(@intCast(src_idx))) |src| {
+            if (new_actual.getConst(@intCast(src_idx))) |src| {
                 line.copyFromSlice(src.cells);
             }
-            self.scrollback_lines.?.set(@intCast(i), line);
+            new_scrollback.set(@intCast(i), line);
         }
 
+        // Now free old buffers AFTER new ones are ready
+        // Note: old_actual may be null if we didn't preserve (grid 1), but self.actual_lines has the real old value
+        if (self.actual_lines) |*al| {
+            var al_mut = al.*;
+            al_mut.deinit();
+        }
+        if (old_scrollback) |*sb| {
+            var sb_mut = sb.*;
+            sb_mut.deinit();
+        }
+
+        // Install new buffers
+        self.actual_lines = new_actual;
+        self.scrollback_lines = new_scrollback;
         self.grid_width = width;
         self.grid_height = height;
         self.scroll_delta = 0;
         self.scroll_animation.reset();
         self.valid = true;
         self.dirty = true;
+        // Don't set needs_content since we preserved old content - it's safe to render immediately
     }
 
     pub fn clear(self: *Self) void {
@@ -461,16 +510,25 @@ pub const RenderedWindow = struct {
         line.cells[col].setText(text);
         line.cells[col].hl_id = hl_id;
         self.dirty = true;
+        // Content received - safe to render this window now
+        self.needs_content = false;
     }
 
-    pub fn setPosition(self: *Self, row: u64, col: u64, _: u64, _: u64) void {
+    pub fn setPosition(self: *Self, row: u64, col: u64, width: u64, height: u64) void {
         self.grid_position = .{ @floatFromInt(col), @floatFromInt(row) };
         self.target_position = self.grid_position;
         self.position_spring_x.position = 0;
         self.position_spring_y.position = 0;
 
+        // Update display dimensions from win_pos
+        // These may differ from grid_width/grid_height during resize animations
+        // win_pos arrives BEFORE grid_resize, so we use these for rendering
+        self.display_width = @intCast(width);
+        self.display_height = @intCast(height);
+
         self.valid = true;
         self.hidden = false;
+        self.has_position = true;
         // DON'T reset zindex/window_type if already set as floating
         // win_pos can come after win_float_pos and we don't want to lose the float info
         // Only reset if this is being set as a docked window (zindex was 0)
@@ -492,6 +550,7 @@ pub const RenderedWindow = struct {
 
         self.valid = true;
         self.hidden = false;
+        self.has_position = true; // Floating windows have positions too!
         self.zindex = zindex;
         self.window_type = .floating;
         self.anchor_info = .{
@@ -513,6 +572,7 @@ pub const RenderedWindow = struct {
 
         self.valid = true;
         self.hidden = false;
+        self.has_position = true; // Message windows have positions too!
         self.zindex = zindex;
         self.window_type = .message;
         self.anchor_info = .{
@@ -648,6 +708,24 @@ pub const RenderedWindow = struct {
         self.dirty = true;
     }
 
+    /// Get the width to use for rendering
+    /// Uses display_width (from win_pos) if set, clamped to grid_width (buffer size)
+    pub fn getRenderWidth(self: *const Self) u32 {
+        if (self.display_width > 0) {
+            return @min(self.display_width, self.grid_width);
+        }
+        return self.grid_width;
+    }
+
+    /// Get the height to use for rendering
+    /// Uses display_height (from win_pos) if set, clamped to grid_height (buffer size)
+    pub fn getRenderHeight(self: *const Self) u32 {
+        if (self.display_height > 0) {
+            return @min(self.display_height, self.grid_height);
+        }
+        return self.grid_height;
+    }
+
     /// Get cell from actual_lines (current viewport)
     pub fn getCell(self: *const Self, row: u32, col: u32) ?*const GridCell {
         if (self.actual_lines == null) return null;
@@ -752,6 +830,9 @@ pub const RenderedWindow = struct {
             const max_delta: f32 = @floatFromInt(inner_size);
             self.scroll_animation.position = std.math.clamp(new_pos, -max_delta, max_delta);
         }
+
+        // Content has been flushed - safe to render this window now
+        self.needs_content = false;
     }
 
     /// Animate the window, returns true if still animating

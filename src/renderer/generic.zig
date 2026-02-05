@@ -976,6 +976,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
         pub fn displayRealized(self: *Self) !void {
+            log.debug("displayRealized called - reinitializing GPU resources", .{});
+
             // If our API has to do things on realize, let it.
             if (@hasDecl(GraphicsAPI, "displayRealized")) {
                 self.api.displayRealized();
@@ -999,12 +1001,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             );
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
+
+            // Force a full redraw after realize. This is critical for Wayland/Hyprland
+            // where window moves (e.g., hy3 layout changes) cause unrealize/realize cycles.
+            // Without this, we might try to presentLastTarget with an invalid framebuffer
+            // or skip drawing because needs_redraw is false.
+            self.markDirty();
+            self.cells_rebuilt = true;
+            log.debug("displayRealized complete - marked dirty for full redraw", .{});
         }
 
         /// This is called by the GTK apprt when the surface is being destroyed.
         /// This can happen because the surface is being closed but also when
         /// moving the window between displays or splitting.
         pub fn displayUnrealized(self: *Self) void {
+            log.debug("displayUnrealized called - cleaning up GPU resources", .{});
+
             // If our API has to do things on unrealize, let it.
             if (@hasDecl(GraphicsAPI, "displayUnrealized")) {
                 self.api.displayUnrealized();
@@ -1077,6 +1089,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Flag that we need to update our custom shaders
             self.custom_shader_focused_changed = true;
 
+            // When regaining focus, force a full redraw.
+            // This fixes black screen issues on Wayland/Hyprland when moving windows
+            // or switching tabs, where the compositor may invalidate the surface
+            // without triggering a proper resize event.
+            if (focus) {
+                self.markDirty();
+                self.cells_rebuilt = true;
+            }
+
             // If we're not focused, then we want to stop the display link
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
@@ -1094,6 +1115,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Must be called on the render thread.
         pub fn setVisible(self: *Self, visible: bool) void {
+            // When becoming visible, force a full redraw.
+            // This fixes black screen issues on Wayland/Hyprland when the window
+            // was occluded and becomes visible again.
+            if (visible) {
+                self.markDirty();
+                self.cells_rebuilt = true;
+            }
+
             // If we're not visible, then we want to stop the display link
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
@@ -1584,10 +1613,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Reset all cells
             self.cells.reset();
 
-            // Use the full grid size we requested from Neovim, not individual window sizes
-            // This ensures we fill the entire terminal area
-            const rows: u16 = @intCast(nvim.grid_height);
-            const cols: u16 = @intCast(nvim.grid_width);
+            // Use grid 1's actual size (what Neovim has responded with), not the requested size.
+            // During rapid resize (e.g., hy3 animations), the requested size may differ from
+            // what Neovim has actually configured, causing rendering mismatches.
+            const grid1 = nvim.windows.get(1) orelse {
+                // Fall back to requested size if grid 1 doesn't exist yet
+                const rows: u16 = @intCast(nvim.grid_height);
+                const cols: u16 = @intCast(nvim.grid_width);
+                log.debug("rebuildCellsFromNeovim: no grid1, using requested size {}x{}", .{ cols, rows });
+                if (rows == 0 or cols == 0) return;
+                if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
+                    try self.cells.resize(self.alloc, .{ .rows = rows, .columns = cols });
+                    self.uniforms.grid_size = .{ cols, rows + 2 };
+                }
+                return; // No windows to render yet
+            };
+
+            const rows: u16 = @intCast(grid1.grid_height);
+            const cols: u16 = @intCast(grid1.grid_width);
+
+            log.debug("rebuildCellsFromNeovim: grid1 size={}x{}, needs_content={}", .{ cols, rows, grid1.needs_content });
 
             if (rows == 0 or cols == 0) return;
 
@@ -1622,11 +1667,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var floating_windows = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
             defer floating_windows.deinit(self.alloc);
 
+            var skipped_needs_content: u32 = 0;
             var window_iter = nvim.windows.valueIterator();
             while (window_iter.next()) |window_ptr| {
                 const window = window_ptr.*;
                 if (window.hidden or !window.valid) continue;
                 if (window.grid_height == 0 or window.grid_width == 0) continue;
+                // Skip windows that haven't received a win_pos yet (except grid 1 which is the outer container)
+                // This prevents rendering grids like the cmdline grid at wrong positions
+                if (!window.has_position and window.id != 1) continue;
+                // Skip windows that were just resized and haven't received content yet
+                // This prevents black flashes during rapid resize (e.g., hy3 animations)
+                if (window.needs_content) {
+                    skipped_needs_content += 1;
+                    continue;
+                }
 
                 // Allow message/floating windows even if actual_lines is null
                 // They may be populated differently
@@ -1689,6 +1744,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 windows_to_render.append(self.alloc, w) catch continue;
             }
 
+            log.debug("rebuildCellsFromNeovim: rendering {} root + {} floating = {} total (skipped {} needs_content)", .{
+                root_windows.items.len,
+                floating_windows.items.len,
+                windows_to_render.items.len,
+                skipped_needs_content,
+            });
+            // Debug: log which windows are being rendered
+            for (root_windows.items) |w| {
+                log.debug("  root window: grid={} pos=({},{}) size={}x{} display={}x{}", .{
+                    w.id,
+                    @as(i32, @intFromFloat(w.grid_position[0])),
+                    @as(i32, @intFromFloat(w.grid_position[1])),
+                    w.grid_width,
+                    w.grid_height,
+                    w.display_width,
+                    w.display_height,
+                });
+            }
+
             // RENDERING STRATEGY:
             //
             // We use painter's algorithm (back to front) for BACKGROUNDS but need occlusion for TEXT.
@@ -1718,10 +1792,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
                 const is_message = window.window_type == .message;
 
+                // Use render dimensions (from win_pos) to avoid artifacts during resize
+                const render_width = window.getRenderWidth();
+                const render_height = window.getRenderHeight();
+
                 var py: u32 = 0;
-                while (py < window.grid_height) : (py += 1) {
+                while (py < render_height) : (py += 1) {
                     var px: u32 = 0;
-                    while (px < window.grid_width) : (px += 1) {
+                    while (px < render_width) : (px += 1) {
                         const sy = @as(u16, @intCast(py)) + win_row;
                         const sx = @as(u16, @intCast(px)) + win_col;
                         if (sy < rows and sx < cols) {
@@ -1750,6 +1828,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const win_col: u16 = @intFromFloat(window.grid_position[0]);
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
 
+                // Use render dimensions (from win_pos) to avoid artifacts during resize
+                // win_pos arrives before grid_resize, so these may be smaller than grid dimensions
+                const render_width = window.getRenderWidth();
+                const render_height = window.getRenderHeight();
+
                 // Check if this is a floating window (includes message windows like NOICE command bar)
                 const is_floating = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
                 const is_message_window = window.window_type == .message;
@@ -1765,13 +1848,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 const margin_top = window.viewport_margins.top;
                 const margin_bottom = window.viewport_margins.bottom;
-                const inner_size = window.grid_height -| margin_top -| margin_bottom;
+                const inner_size = render_height -| margin_top -| margin_bottom;
 
                 // Render top margin rows (winbar etc) - no scroll
                 var row: u32 = 0;
                 while (row < margin_top) : (row += 1) {
                     var col: u32 = 0;
-                    while (col < window.grid_width) : (col += 1) {
+                    while (col < render_width) : (col += 1) {
                         const screen_y = @as(u16, @intCast(row)) + win_row;
                         const screen_x = @as(u16, @intCast(col)) + win_col;
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
@@ -1858,7 +1941,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 var inner_row: u32 = 0;
                 while (inner_row < render_rows) : (inner_row += 1) {
                     var col: u32 = 0;
-                    while (col < window.grid_width) : (col += 1) {
+                    while (col < render_width) : (col += 1) {
                         // Screen position: margin_top + inner_row
                         const screen_row = margin_top + inner_row;
                         const screen_y = @as(u16, @intCast(screen_row)) + win_row;
@@ -1957,10 +2040,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Render bottom margin rows (statusline etc) - no scroll, solid like floating
-                row = window.grid_height -| margin_bottom;
-                while (row < window.grid_height) : (row += 1) {
+                row = render_height -| margin_bottom;
+                while (row < render_height) : (row += 1) {
                     var col: u32 = 0;
-                    while (col < window.grid_width) : (col += 1) {
+                    while (col < render_width) : (col += 1) {
                         const screen_y = @as(u16, @intCast(row)) + win_row;
                         const screen_x = @as(u16, @intCast(col)) + win_col;
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
@@ -2285,6 +2368,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
+            // If our swap chain is defunct (e.g., after displayUnrealized but before
+            // displayRealized), we can't draw. This can happen during window moves
+            // on Wayland/Hyprland where GTK unrealizes but doesn't immediately re-realize.
+            // In this case, try to reinitialize the rendering resources.
+            if (self.swap_chain.defunct or self.shaders.defunct) {
+                log.debug("drawFrame: swap_chain or shaders defunct, attempting reinit", .{});
+                // Try to reinitialize - this is what displayRealized would do
+                self.shaders.deinit(self.alloc);
+                try self.initShaders();
+                self.swap_chain = try SwapChain.init(
+                    self.api,
+                    self.has_custom_shaders,
+                );
+                self.reinitialize_shaders = false;
+                self.target_config_modified = 1;
+                self.markDirty();
+                self.cells_rebuilt = true;
+                log.debug("drawFrame: reinit complete, continuing with frame", .{});
+            }
+
             // Unified timing
             const now = std.time.Instant.now() catch return;
             const last = self.last_frame_time orelse now;
@@ -2388,6 +2491,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const size_changed =
                 self.size.screen.width != surface_size.width or
                 self.size.screen.height != surface_size.height;
+
+            // When size changes, force a full cell rebuild to ensure proper rendering
+            // This is especially important on Wayland/Hyprland where surface invalidation
+            // during window moves or resizes can cause stale framebuffer content
+            if (size_changed) {
+                self.markDirty();
+                self.cells_rebuilt = true;
+                // Clear the cached last target to prevent stale buffer blits
+                self.api.clearLastTarget();
+            }
 
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
@@ -2919,6 +3032,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.size.padding = size.padding;
 
             self.updateScreenSizeUniforms();
+
+            // Mark terminal as dirty to force full redraw on resize.
+            // This ensures content is properly re-rendered after size changes.
+            self.terminal_state.dirty = .full;
+            self.cells_rebuilt = true;
 
             log.debug("screen size size={}", .{size});
         }

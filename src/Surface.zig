@@ -3597,6 +3597,37 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
+    // In Neovim GUI mode, send scroll events to Neovim
+    if (self.nvim_gui) |nvim| {
+        if (yoff != 0) {
+            // Get cursor position for scroll event
+            const pos = try self.rt_surface.getCursorPos();
+            const cell_w: f64 = @floatFromInt(self.size.cell.width);
+            const cell_h: f64 = @floatFromInt(self.size.cell.height);
+            const col: i32 = @intFromFloat(@max(0, pos.x) / cell_w);
+            const row: i32 = @intFromFloat(@max(0, pos.y) / cell_h);
+
+            // Accumulate scroll for smoother mouse wheel handling
+            self.mouse.pending_scroll_y += yoff;
+
+            // Send scroll events to Neovim (wheel ticks)
+            // Note: yoff positive = scroll up in Neovim's convention
+            // Natural scroll inverts this at the OS level, so we just pass through
+            while (self.mouse.pending_scroll_y >= 1.0) {
+                self.mouse.pending_scroll_y -= 1.0;
+                nvim.sendKey("<ScrollWheelUp>") catch {};
+                _ = row;
+                _ = col;
+            }
+            while (self.mouse.pending_scroll_y <= -1.0) {
+                self.mouse.pending_scroll_y += 1.0;
+                nvim.sendKey("<ScrollWheelDown>") catch {};
+            }
+        }
+        try self.queueRender();
+        return;
+    }
+
     // We use cell height to determine if we have accumulated enough to trigger a scroll
     const cell_height: f64 = @floatFromInt(self.size.cell.height);
 
