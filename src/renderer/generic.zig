@@ -1690,6 +1690,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             while (window_iter.next()) |window_ptr| {
                 const window = window_ptr.*;
                 if (window.hidden or !window.valid) continue;
+                if (window.opacity <= 0.0) continue; // Fully transparent (fade-out complete)
                 if (window.grid_height == 0 or window.grid_width == 0) continue;
                 // Skip windows that haven't received a win_pos yet (except grid 1 which is the outer container)
                 // This prevents rendering grids like the cmdline grid at wrong positions
@@ -1894,9 +1895,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const is_floating = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
                 const is_message_window = window.window_type == .message;
 
+                // Per-window opacity for fade-in/fade-out animation (0.0 = invisible, 1.0 = opaque)
+                const win_opacity: u8 = @intFromFloat(std.math.clamp(window.opacity * 255.0, 0.0, 255.0));
+
                 // Get per-window scroll offset in pixels for smooth scrolling
-                // Only editor windows scroll - floating windows and messages don't
-                // Also skip scroll animation if scrollback doesn't have valid data
+                // Only editor windows use scrollback-based smooth scroll.
+                // Floating windows get entirely new content from Neovim on each update,
+                // so scrollback rotation doesn't work for them (causes black rows).
                 const has_valid_scrollback = if (!is_floating) window.hasValidScrollbackData() else false;
                 const scroll_pixel_offset: f32 = if (has_valid_scrollback)
                     window.getSubLineOffset(cell_h)
@@ -1940,7 +1945,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 @intCast((bg_color >> 16) & 0xFF),
                                 @intCast((bg_color >> 8) & 0xFF),
                                 @intCast(bg_color & 0xFF),
-                                255,
+                                win_opacity,
                             },
                             .offset_y_fixed = 0, // Margins don't scroll
                         };
@@ -1990,7 +1995,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Skip extra animation row if another window owns that cell (e.g. statusline)
                         if (is_extra_anim_row and !owns_cell and !cell_unclaimed) continue;
 
-                        // Read from scrollback or actual_lines
+                        // Read from scrollback for smooth scroll animation (editor windows only),
+                        // or actual_lines for floating windows and when scrollback is unavailable
                         const grid_cell = if (!is_floating and has_valid_scrollback)
                             window.getScrollbackCellByInnerRow(inner_row, col)
                         else
@@ -2010,14 +2016,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             bg_color = tmp;
                         }
 
-                        // Floating windows: no scroll offset, solid background.
+                        // Floating windows: no scroll offset, use per-window opacity for fade animation.
                         if (is_floating) {
                             self.cells.bgCell(screen_y, screen_x).* = .{
                                 .color = .{
                                     @intCast((bg_color >> 16) & 0xFF),
                                     @intCast((bg_color >> 8) & 0xFF),
                                     @intCast(bg_color & 0xFF),
-                                    255,
+                                    win_opacity,
                                 },
                                 .offset_y_fixed = 0,
                             };
@@ -2109,7 +2115,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 @intCast((bg_color >> 16) & 0xFF),
                                 @intCast((bg_color >> 8) & 0xFF),
                                 @intCast(bg_color & 0xFF),
-                                255,
+                                win_opacity,
                             },
                             .offset_y_fixed = 0,
                         };

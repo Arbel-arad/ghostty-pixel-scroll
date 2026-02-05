@@ -410,7 +410,18 @@ pub const NeovimGui = struct {
             },
             .win_hide => |grid| {
                 if (self.windows.get(grid)) |window| {
-                    window.hidden = true;
+                    // For floating windows, start fade-out animation instead of instant hide.
+                    // The window stays visible during the fade; once opacity reaches 0,
+                    // the renderer will skip it (opacity check).
+                    if (window.window_type == .floating or window.window_type == .message) {
+                        window.target_opacity = 0.0;
+                        window.opacity_spring.position = window.opacity; // fade from current opacity to 0
+                        window.opacity_spring.velocity = 0;
+                        window.fading_out = true;
+                        // Don't set hidden=true yet — let the animation finish first
+                    } else {
+                        window.hidden = true;
+                    }
                 }
             },
             .win_close => |grid| {
@@ -1212,22 +1223,24 @@ pub const NeovimGui = struct {
             }
         }
 
-        // Check normal windows
+        // Check normal windows — check child windows (grid != 1) FIRST,
+        // then fall back to grid 1 which spans the full screen.
+        // Grid 1 is the outermost container and would match every coordinate,
+        // so child windows (nvim-tree, editor splits, etc.) must take priority.
+        var grid1_entry: ?@TypeOf(normal_windows[0]) = null;
         for (normal_windows[0..normal_count]) |entry| {
-            const window = entry.window;
+            if (entry.grid == 1) {
+                grid1_entry = entry;
+                continue; // Check grid 1 last
+            }
 
-            // Grid 1 is the outer container - use full grid dimensions
-            const pos = if (entry.grid == 1) [2]f32{ 0, 0 } else window.grid_position;
-            // Use display dimensions if set, otherwise fall back to grid dimensions
-            const width: f32 = if (entry.grid == 1)
-                @floatFromInt(self.grid_width)
-            else if (window.display_width > 0)
+            const window = entry.window;
+            const pos = window.grid_position;
+            const width: f32 = if (window.display_width > 0)
                 @floatFromInt(window.display_width)
             else
                 @floatFromInt(window.grid_width);
-            const height: f32 = if (entry.grid == 1)
-                @floatFromInt(self.grid_height)
-            else if (window.display_height > 0)
+            const height: f32 = if (window.display_height > 0)
                 @floatFromInt(window.display_height)
             else
                 @floatFromInt(window.grid_height);
@@ -1236,6 +1249,22 @@ pub const NeovimGui = struct {
             if (width == 0 or height == 0) continue;
 
             if (screen_col >= pos[0] and screen_col < pos[0] + width and
+                screen_row >= pos[1] and screen_row < pos[1] + height)
+            {
+                const local_col: u64 = @intFromFloat(screen_col - pos[0]);
+                const local_row: u64 = @intFromFloat(screen_row - pos[1]);
+                return .{ .grid_id = entry.grid, .col = local_col, .row = local_row };
+            }
+        }
+
+        // Fall back to grid 1 (outermost container)
+        if (grid1_entry) |entry| {
+            const pos = [2]f32{ 0, 0 };
+            const width: f32 = @floatFromInt(self.grid_width);
+            const height: f32 = @floatFromInt(self.grid_height);
+
+            if (width > 0 and height > 0 and
+                screen_col >= pos[0] and screen_col < pos[0] + width and
                 screen_row >= pos[1] and screen_row < pos[1] + height)
             {
                 const local_col: u64 = @intFromFloat(screen_col - pos[0]);

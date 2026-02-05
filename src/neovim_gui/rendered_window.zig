@@ -341,6 +341,22 @@ pub const RenderedWindow = struct {
     /// Position animation length
     position_animation_length: f32 = 0.15,
 
+    /// Opacity animation for floating window fade-in/fade-out.
+    /// Position represents offset from target opacity:
+    /// - 0 = at target opacity (fully visible or fully hidden)
+    /// - negative = fading in (opacity increasing)
+    opacity_spring: Animation.CriticallyDampedSpring = .{},
+
+    /// Current opacity (0.0 = invisible, 1.0 = fully opaque).
+    /// For floating windows, this starts at 0 and animates to 1 on appear.
+    opacity: f32 = 1.0,
+
+    /// Target opacity (what we're animating toward).
+    target_opacity: f32 = 1.0,
+
+    /// Whether this window is currently fading out (kept alive for animation).
+    fading_out: bool = false,
+
     /// Dirty flag - set when content changes
     dirty: bool = true,
 
@@ -537,8 +553,15 @@ pub const RenderedWindow = struct {
     }
 
     pub fn setPosition(self: *Self, row: u64, col: u64, width: u64, height: u64) void {
-        self.grid_position = .{ @floatFromInt(col), @floatFromInt(row) };
-        self.target_position = self.grid_position;
+        const new_x: f32 = @floatFromInt(col);
+        const new_y: f32 = @floatFromInt(row);
+
+        // Non-floating windows (editor splits): instant position, no animation.
+        // Neovim's content grid is already at the new position, and borders/separators
+        // render at the final position. Animating causes the content to lag behind
+        // the border, looking broken.
+        self.grid_position = .{ new_x, new_y };
+        self.target_position = .{ new_x, new_y };
         self.position_spring_x.position = 0;
         self.position_spring_y.position = 0;
 
@@ -566,14 +589,36 @@ pub const RenderedWindow = struct {
         const new_x: f32 = @floatFromInt(col);
         const new_y: f32 = @floatFromInt(row);
 
-        self.grid_position = .{ new_x, new_y };
+        // Animate position from old to new for floating windows
+        if (self.has_position and self.valid and self.window_type == .floating) {
+            self.position_spring_x.position = self.grid_position[0] - new_x;
+            self.position_spring_y.position = self.grid_position[1] - new_y;
+        } else {
+            self.position_spring_x.position = 0;
+            self.position_spring_y.position = 0;
+        }
         self.target_position = .{ new_x, new_y };
-        self.position_spring_x.position = 0;
-        self.position_spring_y.position = 0;
+        self.grid_position = .{
+            new_x + self.position_spring_x.position,
+            new_y + self.position_spring_y.position,
+        };
+
+        // Trigger fade-in if this window was not previously a visible float,
+        // or cancel fade-out if it was fading out (e.g., completion re-appeared).
+        const was_visible_float = self.valid and !self.hidden and self.window_type == .floating and !self.fading_out;
+        if (!was_visible_float) {
+            // Start from current opacity if mid-fade, otherwise from 0
+            const start_opacity = if (self.fading_out) self.opacity else 0.0;
+            self.opacity = start_opacity;
+            self.target_opacity = 1.0;
+            self.opacity_spring.position = start_opacity - 1.0; // Spring toward target (1.0)
+            self.opacity_spring.velocity = 0;
+            self.fading_out = false;
+        }
 
         self.valid = true;
         self.hidden = false;
-        self.has_position = true; // Floating windows have positions too!
+        self.has_position = true;
         self.zindex = zindex;
         self.composition_order = compindex;
         self.window_type = .floating;
@@ -589,6 +634,7 @@ pub const RenderedWindow = struct {
         _ = parent_width;
         const new_y: f32 = @floatFromInt(row);
 
+        // Message windows: instant position, no animation
         self.grid_position = .{ 0, new_y };
         self.target_position = .{ 0, new_y };
         self.position_spring_x.position = 0;
@@ -872,12 +918,36 @@ pub const RenderedWindow = struct {
             animating = true;
         }
 
-        // Window position: INSTANT (no animation)
-        // Neovim plugins like nvim-tree have their own animations - don't interfere
-        self.grid_position[0] = self.target_position[0];
-        self.grid_position[1] = self.target_position[1];
-        self.position_spring_x.reset();
-        self.position_spring_y.reset();
+        // Animate opacity for floating window fade-in/fade-out
+        const opacity_anim_length: f32 = 0.15; // 150ms fade
+        if (self.opacity_spring.update(dt, opacity_anim_length, 1.0)) {
+            self.opacity = std.math.clamp(self.target_opacity + self.opacity_spring.position, 0.0, 1.0);
+            animating = true;
+        } else {
+            self.opacity = self.target_opacity;
+            // Fade-out complete: actually hide the window now
+            if (self.fading_out and self.target_opacity == 0.0) {
+                self.hidden = true;
+                self.fading_out = false;
+            }
+        }
+
+        // Animate window position using springs.
+        // The spring position = offset from target. Set in setPosition/setFloatPosition
+        // when the target changes, then decays to 0 here.
+        const pos_len = self.position_animation_length;
+        const pos_zeta: f32 = 1.0; // critically damped
+
+        if (self.position_spring_x.update(dt, pos_len, pos_zeta)) {
+            animating = true;
+        }
+        if (self.position_spring_y.update(dt, pos_len, pos_zeta)) {
+            animating = true;
+        }
+
+        // grid_position = target + spring offset (decays to target as spring settles)
+        self.grid_position[0] = self.target_position[0] + self.position_spring_x.position;
+        self.grid_position[1] = self.target_position[1] + self.position_spring_y.position;
 
         return animating;
     }

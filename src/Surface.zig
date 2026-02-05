@@ -3614,8 +3614,16 @@ pub fn scrollCallback(
             // Find the window under the cursor and get local grid position
             const window_info = nvim.findWindowAtPosition(screen_col, screen_row);
 
+            // Normalize yoff to lines. For precision scroll (touchpad), yoff is in pixels,
+            // so divide by cell height to get lines. For discrete scroll (mouse wheel),
+            // yoff is already in line-like units.
+            const yoff_lines: f64 = if (scroll_mods.precision)
+                yoff / cell_h
+            else
+                yoff;
+
             // Accumulate scroll for smoother mouse wheel handling
-            self.mouse.pending_scroll_y += yoff;
+            self.mouse.pending_scroll_y += yoff_lines;
 
             // Send scroll events to Neovim using nvim_input_mouse API
             // This targets the specific grid (window) under the cursor
