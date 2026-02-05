@@ -1896,6 +1896,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const inner_size = render_height -| margin_top -| margin_bottom;
 
                 // Render top margin rows (winbar etc) - no scroll
+                // Margin rows use painter's algorithm (no occlusion check) because:
+                // 1. They're excluded from the occlusion map build
+                // 2. Grid 1's interior rows occupy the same screen space but should be
+                //    overwritten by child windows' margin rows (winbar/statusline)
+                // 3. Windows render in z-order (grid 1 first), so later windows correctly
+                //    overpaint both background AND text
                 var row: u32 = 0;
                 while (row < margin_top) : (row += 1) {
                     var col: u32 = 0;
@@ -1904,26 +1910,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         const screen_x = @as(u16, @intCast(col)) + win_col;
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
-                        // Check if this window owns this cell for TEXT rendering
-                        // Margin rows are excluded from the occlusion map, so unclaimed
-                        // cells (owner == 0) in our margin rows belong to us.
-                        const owner = occlusion_map[screen_y * cols + screen_x];
-                        var owns_cell = (owner == window.id) or (owner == 0);
-                        if (is_floating and !owns_cell) {
-                            if (!floating_ids.contains(owner)) {
-                                owns_cell = true;
-                            }
-                        }
-
-                        // For message windows, skip cells we don't own (empty cells)
-                        if (is_message_window and !owns_cell) continue;
-
                         const grid_cell = window.getCell(row, col);
-                        // Get highlight attributes - use getHlAttrForFloat for floating windows
                         const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
                         const hl_attr = if (is_floating) nvim.getHlAttrForFloat(hl_id) else nvim.getHlAttr(hl_id);
 
-                        // getHlAttr always returns non-null colors
                         var fg_color = hl_attr.foreground.?;
                         var bg_color = hl_attr.background.?;
                         if (hl_attr.reverse) {
@@ -1932,65 +1922,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             bg_color = tmp;
                         }
 
-                        // ALWAYS render backgrounds (painter's algorithm - later windows overwrite)
-                        if (is_floating) {
-                            // Floating windows: solid background, no scroll offset
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                .color = .{
-                                    @intCast((bg_color >> 16) & 0xFF),
-                                    @intCast((bg_color >> 8) & 0xFF),
-                                    @intCast(bg_color & 0xFF),
-                                    255,
-                                },
-                                .offset_y_fixed = 0,
-                            };
-                        } else if (hl_attr.blend > 0) {
-                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
-                            const inv_alpha = 255 - blend_alpha;
+                        // Background: always paint (painter's algorithm)
+                        self.cells.bgCell(screen_y, screen_x).* = .{
+                            .color = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            },
+                            .offset_y_fixed = 0, // Margins don't scroll
+                        };
 
-                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
-                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
-                            const cell_b: u16 = @intCast(bg_color & 0xFF);
-                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
-                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
-                            const def_b: u16 = @intCast(default_bg & 0xFF);
-
-                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
-                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
-                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
-
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                .color = .{ final_r, final_g, final_b, 255 },
-                                .offset_y_fixed = 0, // Margins don't scroll
-                            };
-                        } else {
-                            // Solid background
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                .color = .{
-                                    @intCast((bg_color >> 16) & 0xFF),
-                                    @intCast((bg_color >> 8) & 0xFF),
-                                    @intCast(bg_color & 0xFF),
-                                    255,
-                                },
-                                .offset_y_fixed = 0, // Margins don't scroll
-                            };
-                        }
-
-                        // Only render TEXT if this window owns this cell (occlusion check)
-                        if (owns_cell) {
-                            if (grid_cell) |cell| {
-                                const text = cell.getText();
-                                if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
-                            }
-                        } else if (is_floating and grid_cell != null) {
-                            // Debug: log when floating window text is blocked by occlusion
-                            const text = grid_cell.?.getText();
-                            if (text.len > 0 and text[0] != ' ') {
-                                const blocker = occlusion_map[screen_y * cols + screen_x];
-                                log.err("OCCLUSION BLOCKED: grid={} pos=({},{}) text='{s}' blocked_by_grid={}", .{
-                                    window.id, screen_x, screen_y, text, blocker,
-                                });
-                            }
+                        // Text: always render (no occlusion check for margin rows)
+                        if (grid_cell) |cell| {
+                            const text = cell.getText();
+                            if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
                         }
                     }
                 }
