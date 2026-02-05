@@ -208,7 +208,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         corner_cursor: animation.CornerCursorAnimation = animation.CornerCursorAnimation.init(),
 
         /// Last known cursor grid position (for detecting cursor movement)
-        last_cursor_grid_pos: [2]u16 = .{ 0, 0 },
+        /// Initialize to maxInt so first real position triggers a snap
+        last_cursor_grid_pos: [2]u16 = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
 
         /// Last known scroll position (for detecting scroll changes)
         last_cursor_scroll_pos: f32 = 0,
@@ -2303,21 +2304,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update cursor animation if active
             if (self.cursor_animating) {
+                const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                 const cursor_len = self.config.cursor_animation_duration;
                 const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
-                self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+                const floaty_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
 
-                // For non-Neovim mode, update uniform offsets here
-                // Neovim mode updates them in renderNeovimCursor
-                if (self.nvim_gui == null) {
+                if (self.nvim_gui != null) {
+                    // Neovim mode: also update corner animations
+                    const corner_animating = self.corner_cursor.update(dt, cell_w, cell_h);
+                    self.cursor_animating = floaty_animating or corner_animating;
+                } else {
+                    // Terminal mode: only floaty animation
+                    self.cursor_animating = floaty_animating;
+
                     const pos = self.cursor_animation.getPosition();
                     const cursor_x = self.uniforms.cursor_pos[0];
                     const cursor_y = self.uniforms.cursor_pos[1];
                     if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                        const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                        const cell_h_anim: f32 = @floatFromInt(self.grid_metrics.cell_height);
                         const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_w;
-                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_h_anim;
+                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_h;
                         self.uniforms.cursor_offset_x = pos.x - target_x;
                         self.uniforms.cursor_offset_y = pos.y - target_y;
                     }
@@ -3523,7 +3529,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Update cursor animation state
+            // Update cursor animation state (simple offset-based for terminal mode)
             cursor_anim: {
                 const cursor_x = self.uniforms.cursor_pos[0];
                 const cursor_y = self.uniforms.cursor_pos[1];
@@ -3532,36 +3538,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.cursor_animation.snap();
                     self.uniforms.cursor_offset_x = 0;
                     self.uniforms.cursor_offset_y = 0;
+                    self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) false else 0;
                     self.cursor_animating = false;
                     break :cursor_anim;
                 }
 
-                const last_x = self.last_cursor_grid_pos[0];
-                const last_y = self.last_cursor_grid_pos[1];
-
-                if (cursor_x != last_x or cursor_y != last_y) {
-                    const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                    const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
-
-                    const old_pixel_x: f32 = @as(f32, @floatFromInt(last_x)) * cell_width;
-                    const old_pixel_y: f32 = @as(f32, @floatFromInt(last_y)) * cell_height;
-                    const new_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
-                    const new_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
-
-                    self.cursor_animation.current_x = old_pixel_x;
-                    self.cursor_animation.current_y = old_pixel_y;
-                    self.cursor_animation.setTarget(new_pixel_x, new_pixel_y, cell_width);
-
-                    self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
-                    self.cursor_animating = true;
-                }
-
-                const pos = self.cursor_animation.getPosition();
                 const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
                 const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
                 const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
 
+                const last_x = self.last_cursor_grid_pos[0];
+                const last_y = self.last_cursor_grid_pos[1];
+
+                if (cursor_x != last_x or cursor_y != last_y) {
+                    self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+                    self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
+                    self.cursor_animating = true;
+                }
+
+                // Simple offset-based animation for terminal mode
+                self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) false else 0;
+
+                const pos = self.cursor_animation.getPosition();
                 self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
                 self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
             }
