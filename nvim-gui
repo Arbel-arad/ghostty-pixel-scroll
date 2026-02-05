@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Launch Neovim GUI mode in a new Ghostty window
+# This allows you to type "nvim-gui" from your shell to start the smooth-scrolling Neovim GUI
+
+# Get the directory where this script lives
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Launch Ghostty with Neovim GUI mode
+exec "${SCRIPT_DIR}/zig-out/bin/ghostty" --neovim-gui=spawn "$@"

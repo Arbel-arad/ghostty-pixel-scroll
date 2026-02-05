@@ -2066,13 +2066,17 @@ pub fn Stream(comptime Handler: type) type {
                     try self.handler.vt(.progress_report, v);
                 },
 
-                .conemu_sleep,
-                .conemu_show_message_box,
-                .conemu_change_tab_title,
-                .conemu_wait_input,
-                .conemu_guimacro,
-                .conemu_comment,
-                .conemu_xterm_emulation,
+                .conemu_sleep, .conemu_show_message_box, .conemu_change_tab_title, .conemu_wait_input, .conemu_guimacro, .conemu_comment, .conemu_xterm_emulation => {},
+
+                .enter_neovim_gui => {
+                    // OSC 1338 - Enter Neovim GUI mode
+                    // Only forward if handler has surface_mailbox (real termio, not inspector)
+                    if (@hasField(@TypeOf(self.handler), "surface_mailbox")) {
+                        log.info("OSC 1338 received - forwarding to surface mailbox", .{});
+                        _ = self.handler.surface_mailbox.push(.enter_neovim_gui, .{ .instant = {} });
+                    }
+                },
+
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,

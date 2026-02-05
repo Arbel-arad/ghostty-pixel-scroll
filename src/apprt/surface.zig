@@ -108,6 +108,9 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// Enter Neovim GUI mode (triggered by OSC 1338)
+    enter_neovim_gui: void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

@@ -1182,8 +1182,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // If in Neovim GUI mode, use a separate update path
             if (self.nvim_gui) |nvim| {
-                try self.updateFrameNeovim(nvim);
-                return;
+                // Check if Neovim exited (:q, :qall, etc.) - if so, fall back to terminal
+                if (nvim.exited) {
+                    log.info("Neovim exited - falling back to regular terminal mode", .{});
+                    self.nvim_gui = null;
+                    state.nvim_gui = null; // Clear state too so we don't re-enter
+                    // Force full terminal state rebuild - cursor position is stale
+                    self.terminal_state.deinit(self.alloc);
+                    self.terminal_state = .empty;
+                    // Reset last cursor position to force animation target update
+                    self.last_cursor_grid_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
+                    // Continue to regular terminal rendering below
+                } else {
+                    try self.updateFrameNeovim(nvim);
+                    return;
+                }
             }
 
             // We fully deinit and reset the terminal state every so often

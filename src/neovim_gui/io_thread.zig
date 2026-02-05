@@ -140,6 +140,7 @@ pub const Event = union(enum) {
     set_icon: []const u8, // Window icon name (rarely used)
     win_viewport_margins: WinViewportMargins,
     win_external_pos: WinExternalPos,
+    nvim_exited, // Neovim process exited (:q, :qall, etc.)
 
     // Message events (ext_messages)
     msg_show: MsgShow,
@@ -921,7 +922,8 @@ pub const IoThread = struct {
                         // Spin - no sleep, no yield, pure speed
                     },
                     error.ConnectionClosed => {
-                        log.info("Neovim connection closed", .{});
+                        log.info("Neovim connection closed - sending nvim_exited event", .{});
+                        self.event_queue.push(.nvim_exited) catch {};
                         return;
                     },
                     else => {},

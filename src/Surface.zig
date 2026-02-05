@@ -865,8 +865,10 @@ pub fn isNeovimGuiMode(self: *const Surface) bool {
 
 /// Initialize Neovim GUI mode for this surface
 /// This should be called after Surface.init if neovim-gui config is set
+/// or when OSC 1338 is received
 pub fn initNeovimGui(self: *Surface) !void {
-    const socket_path = self.config.neovim_gui_socket orelse return;
+    // If called from OSC 1338, use spawn mode. Otherwise use config.
+    const socket_path = self.config.neovim_gui_socket orelse "spawn";
 
     log.info("Initializing Neovim GUI mode with socket: {s}", .{socket_path});
 
@@ -1275,6 +1277,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .search_selected,
                 .{ .selected = v },
             );
+        },
+
+        .enter_neovim_gui => {
+            // OSC 1338 - Enter Neovim GUI mode dynamically
+            if (self.nvim_gui == null and self.config.neovim_gui_socket == null) {
+                log.info("entering Neovim GUI mode via OSC 1338", .{});
+                self.config.neovim_gui_socket = "spawn";
+                self.initNeovimGui() catch |err| {
+                    log.err("failed to init Neovim GUI: {}", .{err});
+                };
+            }
         },
     }
 }
@@ -2824,10 +2837,29 @@ pub fn keyCallback(
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
 
-    // If we're in Neovim GUI mode, route all non-binding keys to Neovim
-    if (self.nvim_gui != null) {
-        try self.sendKeyToNeovim(event);
-        return .consumed;
+    // If we're in Neovim GUI mode, check if Neovim exited first
+    if (self.nvim_gui) |nvim| {
+        // Check if Neovim process exited (:q, :qall, etc.)
+        if (nvim.exited) {
+            log.info("Neovim exited - cleaning up GUI mode and switching to terminal", .{});
+            // Clean up Neovim GUI
+            nvim.deinit();
+            self.nvim_gui = null;
+            self.renderer_state.nvim_gui = null;
+            self.config.neovim_gui_socket = null; // Allow re-entering GUI mode
+
+            // Reset cursor blink state so it starts animating again
+            _ = self.renderer_thread.mailbox.push(.reset_cursor_blink, .{ .instant = {} });
+
+            try self.queueRender();
+
+            // Consume this key event - the terminal will show fresh on next frame
+            return .consumed;
+        } else {
+            // Route key to Neovim
+            try self.sendKeyToNeovim(event);
+            return .consumed;
+        }
     }
 
     // If we allow KAM and KAM is enabled then we do nothing.

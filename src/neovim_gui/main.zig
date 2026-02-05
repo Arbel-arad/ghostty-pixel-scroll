@@ -110,6 +110,9 @@ pub const NeovimGui = struct {
     /// Restart state (Neovim is restarting, preserves state)
     restarting: bool = false,
 
+    /// Exited state (Neovim exited via :q, :qall, etc.)
+    exited: bool = false,
+
     /// Window title from Neovim (set_title event)
     title: []const u8 = "",
 
@@ -663,6 +666,11 @@ pub const NeovimGui = struct {
             .tabline_update => |data| {
                 log.info("tabline_update: current_tab={}, {} tabs", .{ data.current_tab, data.tabs.len });
                 // Store tabline state for rendering if ext_tabline is enabled
+                self.dirty = true;
+            },
+            .nvim_exited => {
+                log.info("Neovim exited - setting exited flag", .{});
+                self.exited = true;
                 self.dirty = true;
             },
         }

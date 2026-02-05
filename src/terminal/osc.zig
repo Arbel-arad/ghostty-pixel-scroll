@@ -152,6 +152,9 @@ pub const Command = union(Key) {
     /// Kitty text sizing protocol (OSC 66)
     kitty_text_sizing: parsers.kitty_text_sizing.OSC,
 
+    /// Ghostty: Enter Neovim GUI mode (OSC 1338)
+    enter_neovim_gui: void,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const Key = LibEnum(
@@ -181,6 +184,7 @@ pub const Command = union(Key) {
             "conemu_xterm_emulation",
             "conemu_comment",
             "kitty_text_sizing",
+            "enter_neovim_gui",
         },
     );
 
@@ -340,6 +344,7 @@ pub const Parser = struct {
         @"133",
         @"777",
         @"1337",
+        @"1338",
     };
 
     pub fn init(alloc: ?Allocator) Parser {
@@ -401,6 +406,7 @@ pub const Parser = struct {
             .semantic_prompt,
             .show_desktop_notification,
             .kitty_text_sizing,
+            .enter_neovim_gui,
             => {},
         }
 
@@ -598,10 +604,12 @@ pub const Parser = struct {
             => switch (c) {
                 ';' => self.writeToFixed(),
                 '7' => self.state = .@"1337",
+                '8' => self.state = .@"1338",
                 else => self.state = .invalid,
             },
 
             .@"1337",
+            .@"1338",
             => switch (c) {
                 ';' => self.writeToFixed(),
                 else => self.state = .invalid,
@@ -690,6 +698,13 @@ pub const Parser = struct {
             .@"777" => parsers.rxvt_extension.parse(self, terminator_ch),
 
             .@"1337" => parsers.iterm2.parse(self, terminator_ch),
+
+            .@"1338" => {
+                // OSC 1338 - Enter Neovim GUI mode
+                // Usage: printf '\e]1338\a'
+                self.command = .enter_neovim_gui;
+                return &self.command;
+            },
         };
     }
 };

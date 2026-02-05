@@ -440,6 +440,16 @@ fn drainMailbox(self: *Thread) !void {
                         self,
                         cursorTimerCallback,
                     );
+                } else {
+                    // Timer not active, start it
+                    self.cursor_h.run(
+                        &self.loop,
+                        &self.cursor_c,
+                        cursorBlinkInterval(),
+                        Thread,
+                        self,
+                        cursorTimerCallback,
+                    );
                 }
             },
 
