@@ -197,6 +197,57 @@ pub const Uniforms = extern struct {
     /// Various booleans, in a packed struct for space efficiency.
     bools: Bools align(4),
 
+    /// Sub-line pixel scroll offset for smooth scrolling.
+    /// Positive values scroll content up (user scrolled into history).
+    pixel_scroll_offset_y: f32 align(4) = 0,
+
+    /// Cursor position offset in pixels for smooth cursor animation.
+    /// These offsets are applied to the cursor glyph position.
+    cursor_offset_x: f32 align(4) = 0,
+    cursor_offset_y: f32 align(4) = 0,
+
+    /// Neovide-style stretchy cursor - 4 corner positions in pixels
+    /// Order: top-left, top-right, bottom-right, bottom-left
+    cursor_corner_tl: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_tr: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_br: [2]f32 align(8) = .{ 0, 0 },
+    cursor_corner_bl: [2]f32 align(8) = .{ 0, 0 },
+    /// Whether to use corner-based cursor rendering (as u32 for GLSL std140 alignment)
+    cursor_use_corners: u32 align(4) = 0,
+
+    /// Sonicboom VFX: expanding ring effect on cursor arrival
+    sonicboom_center: [2]f32 align(8) = .{ -100, -100 },
+    sonicboom_radius: f32 align(4) = 0,
+    sonicboom_thickness: f32 align(4) = 3.0,
+    sonicboom_color: [4]u8 align(4) = .{ 255, 255, 255, 0 },
+
+    /// TUI smooth scrolling: pixel offset for cells within the scroll region.
+    tui_scroll_offset_y: f32 align(4) = 0,
+    tui_scroll_region_top: u16 align(2) = 0,
+    tui_scroll_region_bottom: u16 align(2) = 0,
+
+    /// SDF rounded corner radius in pixels (0 = disabled)
+    corner_radius: f32 align(4) = 0,
+
+    /// Gap color for SDF rounding (what shows between rounded windows)
+    gap_color: [4]u8 align(4) = .{ 0x0a, 0x0a, 0x0a, 0xFF },
+
+    /// Matte/ink color post-processing intensity (0.0 = off, 1.0 = full)
+    matte_intensity: f32 align(4) = 0,
+
+    /// Text gamma adjustment. 0.0 = standard sRGB (gamma 2.2).
+    text_gamma: f32 align(4) = 0,
+
+    /// Text contrast adjustment. 0.0 = no change, 1.0 = maximum contrast.
+    text_contrast: f32 align(4) = 0,
+
+    /// Number of active window rects for SDF rounding (packed as u32 for std140)
+    window_rect_count: u32 align(4) = 0,
+
+    /// Window rectangles for SDF rounding: {x, y, w, h} in pixel coords
+    /// Max 16 windows. Stored as vec4 array for std140 layout.
+    window_rects: [16][4]f32 align(16) = [_][4]f32{.{ 0, 0, 0, 0 }} ** 16,
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,
@@ -218,7 +269,10 @@ pub const Uniforms = extern struct {
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool = false,
 
-        _padding: u28 = 0,
+        /// Whether to exclude cursor glyphs from rendering (used for scroll animation)
+        exclude_cursor: bool = false,
+
+        _padding: u27 = 0,
     };
 
     const PaddingExtend = packed struct(u32) {
@@ -243,6 +297,10 @@ pub const CellText = extern struct {
         is_cursor_glyph: bool = false,
         _padding: u6 = 0,
     } align(1) = .{},
+    /// Per-cell pixel Y offset for smooth scrolling (sub-pixel precision)
+    /// Uses 8.8 fixed-point format: upper 8 bits = integer, lower 8 bits = fraction
+    /// Range: -128.0 to +127.996 pixels
+    pixel_offset_y: i16 align(2) = 0,
 
     pub const Atlas = enum(u8) {
         grayscale = 0,
@@ -257,7 +315,16 @@ pub const CellText = extern struct {
 };
 
 /// This is a single parameter for the cell bg shader.
-pub const CellBg = [4]u8;
+/// Includes per-cell Y offset for smooth background scrolling (Neovim cursorline, etc.)
+pub const CellBg = extern struct {
+    color: [4]u8,
+    /// Per-cell Y offset in pixels for smooth scrolling
+    /// Stored as 8.8 fixed point (i16): value = pixels * 256
+    offset_y_fixed: i16 = 0,
+    /// Window index for SDF rounding (0 = no window/default, 1-16 = window rect index)
+    window_id: u8 = 0,
+    _padding: [1]u8 = .{0}, // Align to 8 bytes for GPU buffer
+};
 
 /// Single parameter for the image shader. See shader for field details.
 pub const Image = extern struct {
@@ -297,6 +364,27 @@ pub const BgImage = extern struct {
             none = 3,
         };
     };
+};
+
+/// Uniforms for the scroll blend shader (for smooth TUI scrolling).
+/// Implements Neovide-style scrolling where border rows stay fixed.
+pub const ScrollBlendUniforms = extern struct {
+    /// Blend factor: 0.0 = all previous frame, 1.0 = all current frame
+    blend_factor: f32 align(4),
+    /// Vertical scroll offset in pixels (animates toward 0)
+    scroll_offset_y: f32 align(4),
+    /// Total screen height for UV calculations
+    screen_height: f32 align(4),
+    /// Total screen width for UV calculations
+    screen_width: f32 align(4),
+    /// Height of one cell in pixels
+    cell_height: f32 align(4),
+    /// Top of scroll region in pixels (rows above this are fixed)
+    scroll_region_top: f32 align(4),
+    /// Bottom of scroll region in pixels (rows at/below this are fixed)
+    scroll_region_bot: f32 align(4),
+    /// Top padding in pixels
+    padding_top: f32 align(4),
 };
 
 /// Initialize our custom shader pipelines. The shaders argument is a

@@ -1,12 +1,27 @@
 #include "common.glsl"
 
+// Position the origin to the upper left for clipping check
+layout(origin_upper_left) in vec4 gl_FragCoord;
+
 layout(binding = 0) uniform sampler2DRect atlas_grayscale;
 layout(binding = 1) uniform sampler2DRect atlas_color;
+
+// Per-cell background data for checking if fragment falls into fixed (statusline) region
+struct CellBgData {
+    uint color;
+    int offset_and_winid;
+};
+
+layout(binding = 1, std430) readonly buffer bg_cells {
+    CellBgData cells[];
+};
 
 in CellTextVertexOut {
     flat uint atlas;
     flat vec4 color;
     flat vec4 bg_color;
+    flat int pixel_offset_y;  // From vertex shader for clipping check
+    flat uvec2 cell_grid_pos;  // Original grid position for TUI scroll clipping
     vec2 tex_coord;
 } in_data;
 
@@ -18,6 +33,66 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
+    // Check if this fragment is scrolling text that landed in a fixed cell (statusline)
+    // Only clip if: this text HAS an offset AND lands in a cell with offset=0
+    if (in_data.pixel_offset_y != 0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        vec2 adjusted_coord = gl_FragCoord.xy;
+        adjusted_coord.y += pixel_scroll_offset_y;
+        ivec2 dest_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        
+        if (dest_grid_pos.x >= 0 && dest_grid_pos.x < int(grid_size.x) &&
+            dest_grid_pos.y >= 0 && dest_grid_pos.y < int(grid_size.y)) {
+            int cell_index = dest_grid_pos.y * int(grid_size.x) + dest_grid_pos.x;
+            int offset_raw = cells[cell_index].offset_and_winid;
+            int offset_i16 = (offset_raw << 16) >> 16;
+            
+            // If dest cell is fixed (offset=0) but this text has offset, clip it
+            // This prevents scrolling text from bleeding into statusline
+            if (offset_i16 == 0) {
+                discard;
+            }
+        }
+    }
+    // Clip TUI scrolling text at scroll region boundaries
+    if (tui_scroll_offset_y != 0.0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        uvec2 tui_region = unpack2u16(tui_scroll_region_packed);
+        vec2 adj = gl_FragCoord.xy;
+        adj.y += pixel_scroll_offset_y;
+        ivec2 frag_grid = ivec2(floor((adj - grid_padding.wx) / cell_size));
+        if (in_data.cell_grid_pos.y >= tui_region.x &&
+            in_data.cell_grid_pos.y <= tui_region.y) {
+            if (frag_grid.y < int(tui_region.x) || frag_grid.y > int(tui_region.y)) {
+                discard;
+            }
+        }
+    }
+
+    // SDF Rounded Corners: clip text fragments outside rounded rect
+    if (corner_radius > 0.0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        ivec2 text_grid = ivec2(in_data.cell_grid_pos);
+        if (text_grid.x >= 0 && text_grid.x < int(grid_size.x) &&
+            text_grid.y >= 0 && text_grid.y < int(grid_size.y)) {
+            int ci = text_grid.y * int(grid_size.x) + text_grid.x;
+            uint wid = uint(cells[ci].offset_and_winid >> 16) & 0xFFu;
+            if (wid > 0u && wid <= window_rect_count) {
+                vec4 wrect = window_rects[wid - 1u];
+                vec2 win_pos = wrect.xy;
+                vec2 win_size = wrect.zw;
+                vec2 center = win_pos + win_size * 0.5;
+                vec2 half_size = win_size * 0.5;
+                float r = corner_radius;
+                vec2 d = abs(gl_FragCoord.xy - center) - half_size + vec2(r);
+                float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+                if (dist > 0.0) {
+                    discard;
+                }
+            }
+        }
+    }
+
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
 
@@ -41,6 +116,18 @@ void main() {
 
             // Fetch our alpha mask for this pixel.
             float a = texture(atlas_grayscale, in_data.tex_coord).r;
+
+            // Text gamma/contrast adjustment (matches Neovide's text_gamma/text_contrast).
+            if (text_gamma != 0.0 || text_contrast != 0.0) {
+                if (text_gamma != 0.0) {
+                    float gamma_exp = 1.0 / (1.0 + text_gamma);
+                    a = pow(a, gamma_exp);
+                }
+                if (text_contrast > 0.0) {
+                    float k = 1.0 + text_contrast * 4.0;
+                    a = clamp((a - 0.5) * k + 0.5, 0.0, 1.0);
+                }
+            }
 
             // Linear blending weight correction corrects the alpha value to
             // produce blending results which match gamma-incorrect blending.

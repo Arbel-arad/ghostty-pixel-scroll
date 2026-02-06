@@ -23,6 +23,31 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
+    uniform float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels (terminal scrollback)
+    uniform float cursor_offset_x;  // Cursor animation X offset in pixels
+    uniform float cursor_offset_y;  // Cursor animation Y offset in pixels
+    // Neovide-style stretchy cursor - 4 corner positions in pixels
+    uniform vec2 cursor_corner_tl;  // Top-left corner
+    uniform vec2 cursor_corner_tr;  // Top-right corner
+    uniform vec2 cursor_corner_br;  // Bottom-right corner
+    uniform vec2 cursor_corner_bl;  // Bottom-left corner
+    uniform uint cursor_use_corners;  // Whether to use corner-based rendering (as uint for alignment)
+    // Sonicboom VFX
+    uniform vec2 sonicboom_center;     // Pixel position of ring center
+    uniform float sonicboom_radius;    // Current ring radius in pixels
+    uniform float sonicboom_thickness; // Ring thickness in pixels
+    uniform uint sonicboom_color_packed; // Packed RGBA color
+    // TUI smooth scrolling
+    uniform float tui_scroll_offset_y;     // Pixel offset for scroll region cells
+    uniform uint tui_scroll_region_packed; // Packed 2x u16: top (low 16), bottom (high 16)
+    // SDF rounded corners
+    uniform float corner_radius;           // Corner radius in pixels (0 = disabled)
+    uniform uint gap_color_packed;         // Gap color between rounded windows (packed RGBA)
+    uniform float matte_intensity;         // Matte/ink post-processing (0 = off, 1 = full)
+    uniform float text_gamma;              // Text gamma adjustment (0 = standard sRGB)
+    uniform float text_contrast;           // Text contrast adjustment (0 = no change)
+    uniform uint window_rect_count;        // Number of active window rects
+    uniform vec4 window_rects[16];         // Window pixel rects: {x, y, w, h}
 };
 
 // Bools
@@ -30,6 +55,7 @@ const uint CURSOR_WIDE = 1u;
 const uint USE_DISPLAY_P3 = 2u;
 const uint USE_LINEAR_BLENDING = 4u;
 const uint USE_LINEAR_CORRECTION = 8u;
+const uint EXCLUDE_CURSOR = 16u;
 
 // Padding extend enum
 const uint EXTEND_LEFT = 1u;

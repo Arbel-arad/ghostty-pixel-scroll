@@ -922,6 +922,67 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Enable per-pixel scrolling for high precision input devices (for example
+/// touchpads). When enabled, scrollback can move by sub-line increments
+/// instead of only whole lines. This provides a much smoother scrolling
+/// experience.
+///
+/// This only affects scrolling the terminal's own scrollback, not applications
+/// running inside the terminal (for example full-screen TUIs) that handle
+/// scrolling themselves.
+@"pixel-scroll": bool = false,
+
+/// The duration of the cursor animation in seconds. 0 = no animation (instant).
+/// Recommended: 0.06 for a smooth feel, Neovide uses ~0.04-0.15.
+/// When neovim-gui is active and this is 0, defaults to 0.06 automatically.
+@"cursor-animation-duration": f32 = 0.0,
+
+/// The bounciness of the cursor animation (0.0 to 1.0).
+@"cursor-animation-bounciness": f32 = 0.0,
+
+/// The duration of the scroll animation in seconds. 0 = no animation (instant).
+/// Controls smooth content-arrival animation: small output (1-3 lines) glides in
+/// gently, large dumps (4+ lines) get a satisfying spring drop. Rapid streaming
+/// output (docker logs, builds) is automatically detected and snaps instantly.
+/// When neovim-gui is active and this is 0, defaults to 0.2 automatically.
+@"scroll-animation-duration": f32 = 0.15,
+
+/// The bounciness of the scroll animation (0.0 to 1.0).
+@"scroll-animation-bounciness": f32 = 0.0,
+
+/// Enable Neovim GUI mode. Ghostty becomes a native Neovim GUI client
+/// (like Neovide) instead of a terminal emulator.
+///
+/// Options:
+///   * "spawn" (recommended) - Spawn nvim with --listen and connect via socket.
+///     Loads your full user config.
+///   * "embed" - Spawn nvim with --embed (direct pipe, also loads user config).
+///   * Socket path - Connect to an existing instance, e.g. neovim-gui = /tmp/nvim.sock
+///
+/// Empty string (default) = normal terminal mode.
+@"neovim-gui": []const u8 = "",
+
+/// Gap color between Neovim windows. Visible when neovim-corner-radius > 0.
+@"neovim-gap-color": Color = .{ .r = 0x0a, .g = 0x0a, .b = 0x0a },
+
+/// Rounded corner radius (pixels) for Neovim windows. 0 = sharp corners.
+/// Recommended: 8.0 for a polished look.
+/// When neovim-gui is active and this is 0, defaults to 8.0 automatically.
+@"neovim-corner-radius": f32 = 0.0,
+
+/// Matte/ink post-processing intensity (0.0 = off, 1.0 = full).
+/// Gives colors a physical-ink quality with subtle desaturation,
+/// shadow lift, and cool-tinted shadows. Recommended: 0.5.
+@"matte-rendering": f32 = 0.0,
+
+/// Text gamma for glyph weight. 0.0 = standard sRGB (default).
+/// Positive = thicker/darker, negative = thinner/lighter.
+@"text-gamma": f32 = 0.0,
+
+/// Text contrast for glyph edge sharpness. 0.0 = no adjustment.
+/// Higher values sharpen edges by steepening the alpha curve.
+@"text-contrast": f32 = 0.0,
+
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0
 /// or greater than 1 will be clamped to the nearest valid value.

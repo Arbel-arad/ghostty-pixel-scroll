@@ -91,6 +91,15 @@ pub const RenderState = struct {
     selection_cache: ?SelectionCache = null,
 
     /// Initial state.
+    scroll_jump: f32 = 0,
+    last_scroll_tracker: isize = 0,
+
+    /// Scroll region boundaries (row indices, inclusive).
+    /// Used by the renderer to apply smooth scroll offset only within
+    /// the scroll region for TUI apps in alternate screen.
+    scroll_region_top: u16 = 0,
+    scroll_region_bottom: u16 = 0,
+
     pub const empty: RenderState = .{
         .rows = 0,
         .cols = 0,
@@ -259,6 +268,95 @@ pub const RenderState = struct {
     ///
     /// This will reset the terminal dirty state since it is consumed
     /// by this render state update.
+    fn updateRow(
+        self: *RenderState,
+        alloc: Allocator,
+        y: usize,
+        row_pin: PageList.Pin,
+        last_dirty_page: *?*page.Page,
+        redraw: bool,
+    ) !bool {
+        const row_data = self.row_data.slice();
+        const row_pins = row_data.items(.pin);
+        const row_rows = row_data.items(.raw);
+        const row_cells = row_data.items(.cells);
+        const row_sels = row_data.items(.selection);
+        const row_highlights = row_data.items(.highlights);
+        const row_dirties = row_data.items(.dirty);
+        const row_arenas = row_data.items(.arena);
+
+        row_pins[y] = row_pin;
+        const p: *page.Page = &row_pin.node.data;
+        const page_rac = row_pin.rowAndCell();
+
+        var is_dirty = false;
+        dirty: {
+            if (redraw) {
+                is_dirty = true;
+                break :dirty;
+            }
+            if (p == last_dirty_page.*) {
+                is_dirty = true;
+                break :dirty;
+            }
+            if (p.dirty) {
+                if (last_dirty_page.*) |last_p| last_p.dirty = false;
+                last_dirty_page.* = p;
+                is_dirty = true;
+                break :dirty;
+            }
+            if (page_rac.row.dirty) {
+                is_dirty = true;
+                break :dirty;
+            }
+        }
+
+        if (!is_dirty) return false;
+
+        page_rac.row.dirty = false;
+        var arena = row_arenas[y].promote(alloc);
+        defer row_arenas[y] = arena.state;
+
+        if (row_cells[y].len > 0) {
+            _ = arena.reset(.retain_capacity);
+            row_cells[y].clearRetainingCapacity();
+            row_sels[y] = null;
+            row_highlights[y] = .empty;
+        }
+        row_dirties[y] = true;
+
+        const page_cells: []const page.Cell = p.getCells(page_rac.row);
+        assert(page_cells.len == self.cols);
+        row_rows[y] = page_rac.row.*;
+
+        const cells: *std.MultiArrayList(Cell) = &row_cells[y];
+        try cells.resize(alloc, self.cols);
+        const cells_slice = cells.slice();
+        fastmem.copy(page.Cell, cells_slice.items(.raw), page_cells);
+
+        if (!page_rac.row.managedMemory()) return true;
+
+        const arena_alloc = arena.allocator();
+        const cells_grapheme = cells_slice.items(.grapheme);
+        const cells_style = cells_slice.items(.style);
+        for (page_cells, 0..) |*page_cell, x| {
+            if (page_cell.style_id > 0) cells_style[x] = p.styles.get(p.memory, page_cell.style_id).*;
+            switch (page_cell.content_tag) {
+                .codepoint => {},
+                .codepoint_grapheme => {
+                    cells_grapheme[x] = try arena_alloc.dupe(u21, p.lookupGrapheme(page_cell) orelse &.{});
+                },
+                .bg_color_rgb => {
+                    cells_style[x] = .{ .bg_color = .{ .rgb = .{ .r = page_cell.content.color_rgb.r, .g = page_cell.content.color_rgb.g, .b = page_cell.content.color_rgb.b } } };
+                },
+                .bg_color_palette => {
+                    cells_style[x] = .{ .bg_color = .{ .palette = page_cell.content.color_palette } };
+                },
+            }
+        }
+        return true;
+    }
+
     pub fn update(
         self: *RenderState,
         alloc: Allocator,
@@ -267,45 +365,58 @@ pub const RenderState = struct {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
         const redraw = redraw: {
-            // If our screen key changed, we need to do a full rebuild
-            // because our render state is viewport-specific.
             if (t.screens.active_key != self.screen) break :redraw true;
-
-            // If our terminal is dirty at all, we do a full rebuild. These
-            // dirty values are full-terminal dirty values.
             {
                 const Int = @typeInfo(Terminal.Dirty).@"struct".backing_integer.?;
                 const v: Int = @bitCast(t.flags.dirty);
                 if (v > 0) break :redraw true;
             }
-
-            // If our screen is dirty at all, we do a full rebuild. This is
-            // a full screen dirty tracker.
             {
                 const Int = @typeInfo(Screen.Dirty).@"struct".backing_integer.?;
                 const v: Int = @bitCast(t.screens.active.dirty);
                 if (v > 0) break :redraw true;
             }
-
-            // If our dimensions changed, we do a full rebuild.
-            if (self.rows != s.pages.rows or
+            if (self.rows != s.pages.rows + 2 or
                 self.cols != s.pages.cols)
             {
                 break :redraw true;
             }
-
-            // If our viewport pin changed, we do a full rebuild.
             if (self.viewport_pin) |old| {
                 if (!old.eql(viewport_pin)) break :redraw true;
             }
-
             break :redraw false;
         };
 
-        // Always set our cheap fields, its more expensive to compare
-        self.rows = s.pages.rows;
+        self.rows = s.pages.rows + 2;
         self.cols = s.pages.cols;
+
+        // Calculate scroll jump
+        self.scroll_jump = 0;
+        if (self.viewport_pin) |old| {
+            if (old.node == viewport_pin.node) {
+                const old_y = @as(f32, @floatFromInt(old.y));
+                const new_y = @as(f32, @floatFromInt(viewport_pin.y));
+                self.scroll_jump = old_y - new_y;
+            } else if (old.node.next == viewport_pin.node) {
+                const page_rows = @as(f32, @floatFromInt(old.node.data.size.rows));
+                const old_y = @as(f32, @floatFromInt(old.y));
+                const new_y = @as(f32, @floatFromInt(viewport_pin.y));
+                self.scroll_jump = old_y - (page_rows + new_y);
+            } else if (old.node.prev == viewport_pin.node) {
+                const prev_rows = @as(f32, @floatFromInt(viewport_pin.node.data.size.rows));
+                const old_y = @as(f32, @floatFromInt(old.y));
+                const new_y = @as(f32, @floatFromInt(viewport_pin.y));
+                self.scroll_jump = (prev_rows + old_y) - new_y;
+            }
+        }
+
+        const tracker_diff = s.scroll_tracker - self.last_scroll_tracker;
+        self.scroll_jump += @floatFromInt(tracker_diff);
+        self.last_scroll_tracker = s.scroll_tracker;
+
         self.viewport_pin = viewport_pin;
+        self.scroll_region_top = @intCast(t.scrolling_region.top);
+        self.scroll_region_bottom = @intCast(t.scrolling_region.bottom);
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
         self.cursor.style = s.cursor.style;
@@ -313,20 +424,11 @@ pub const RenderState = struct {
         self.cursor.password_input = t.flags.password_input;
         self.cursor.visible = t.modes.get(.cursor_visible);
         self.cursor.blinking = t.modes.get(.cursor_blinking);
-
-        // Always reset the cursor viewport position. In the future we can
-        // probably cache this by comparing the cursor pin and viewport pin
-        // but may not be worth it.
         self.cursor.viewport = null;
 
-        // Colors.
         self.colors.cursor = t.colors.cursor.get();
         self.colors.palette = t.colors.palette.current;
         bg_fg: {
-            // Background/foreground can be unset initially which would
-            // depend on "default" background/foreground. The expected use
-            // case of Terminal is that the caller set their own configured
-            // defaults on load so this doesn't happen.
             const bg = t.colors.background.get() orelse break :bg_fg;
             const fg = t.colors.foreground.get() orelse break :bg_fg;
             if (t.modes.get(.reverse_colors)) {
@@ -338,20 +440,11 @@ pub const RenderState = struct {
             }
         }
 
-        // Ensure our row length is exactly our height, freeing or allocating
-        // data as necessary. In most cases we'll have a perfectly matching
-        // size.
         if (self.row_data.len != self.rows) {
             @branchHint(.unlikely);
-
             if (self.row_data.len < self.rows) {
-                // Resize our rows to the desired length, marking any added
-                // values undefined.
                 const old_len = self.row_data.len;
                 try self.row_data.resize(alloc, self.rows);
-
-                // Initialize all our values. Its faster to use slice() + set()
-                // because appendAssumeCapacity does this multiple times.
                 var row_data = self.row_data.slice();
                 for (old_len..self.rows) |y| {
                     row_data.set(y, .{
@@ -378,31 +471,36 @@ pub const RenderState = struct {
             }
         }
 
-        // Break down our row data
         const row_data = self.row_data.slice();
-        const row_arenas = row_data.items(.arena);
         const row_pins = row_data.items(.pin);
-        const row_rows = row_data.items(.raw);
-        const row_cells = row_data.items(.cells);
         const row_sels = row_data.items(.selection);
-        const row_highlights = row_data.items(.highlights);
-        const row_dirties = row_data.items(.dirty);
-
-        // Track the last page that we know was dirty. This lets us
-        // more quickly do the full-page dirty check.
         var last_dirty_page: ?*page.Page = null;
-
-        // Go through and setup our rows.
-        var row_it = s.pages.rowIterator(
-            .right_down,
-            .{ .viewport = .{} },
-            null,
-        );
         var y: size.CellCountInt = 0;
         var any_dirty: bool = false;
-        while (row_it.next()) |row_pin| : (y = y + 1) {
-            // Find our cursor if we haven't found it yet. We do this even
-            // if the row is not dirty because the cursor is unrelated.
+
+        // 1. Previous Row (Top)
+        {
+            var prev_pin: ?PageList.Pin = null;
+            if (viewport_pin.y > 0) {
+                var p = viewport_pin;
+                p.y -= 1;
+                prev_pin = p;
+            } else if (viewport_pin.node.prev) |n| {
+                prev_pin = .{ .node = n, .y = n.data.size.rows - 1 };
+            }
+
+            if (prev_pin) |pin| {
+                if (try self.updateRow(alloc, y, pin, &last_dirty_page, redraw)) any_dirty = true;
+            } else {
+                row_data.items(.cells)[y].resize(alloc, 0) catch {};
+                row_data.items(.dirty)[y] = false;
+            }
+            y += 1;
+        }
+
+        // 2. Viewport Rows
+        var row_it = s.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+        while (row_it.next()) |row_pin| : (y += 1) {
             if (self.cursor.viewport == null and
                 row_pin.node == s.cursor.page_pin.node and
                 row_pin.y == s.cursor.page_pin.y)
@@ -410,181 +508,46 @@ pub const RenderState = struct {
                 self.cursor.viewport = .{
                     .y = y,
                     .x = s.cursor.x,
-
-                    // Future: we should use our own state here to look this
-                    // up rather than calling this.
-                    .wide_tail = if (s.cursor.x > 0)
-                        s.cursorCellLeft(1).wide == .wide
-                    else
-                        false,
+                    .wide_tail = if (s.cursor.x > 0) s.cursorCellLeft(1).wide == .wide else false,
                 };
             }
-
-            // Store our pin. We have to store these even if we're not dirty
-            // because dirty is only a renderer optimization. It doesn't
-            // apply to memory movement. This will let us remap any cell
-            // pins back to an exact entry in our RenderState.
-            row_pins[y] = row_pin;
-
-            // Get all our cells in the page.
-            const p: *page.Page = &row_pin.node.data;
-            const page_rac = row_pin.rowAndCell();
-
-            dirty: {
-                // If we're redrawing then we're definitely dirty.
-                if (redraw) break :dirty;
-
-                // If our page is the same as last time then its dirty.
-                if (p == last_dirty_page) break :dirty;
-                if (p.dirty) {
-                    // If this page is dirty then clear the dirty flag
-                    // of the last page and then store this one. This benchmarks
-                    // faster than iterating pages again later.
-                    if (last_dirty_page) |last_p| last_p.dirty = false;
-                    last_dirty_page = p;
-                    break :dirty;
-                }
-
-                // If our row is dirty then we're dirty.
-                if (page_rac.row.dirty) break :dirty;
-
-                // Not dirty!
-                continue;
-            }
-
-            // Set that at least one row was dirty.
-            any_dirty = true;
-
-            // Clear our row dirty, we'll clear our page dirty later.
-            // We can't clear it now because we have more rows to go through.
-            page_rac.row.dirty = false;
-
-            // Promote our arena. State is copied by value so we need to
-            // restore it on all exit paths so we don't leak memory.
-            var arena = row_arenas[y].promote(alloc);
-            defer row_arenas[y] = arena.state;
-
-            // Reset our cells if we're rebuilding this row.
-            if (row_cells[y].len > 0) {
-                _ = arena.reset(.retain_capacity);
-                row_cells[y].clearRetainingCapacity();
-                row_sels[y] = null;
-                row_highlights[y] = .empty;
-            }
-            row_dirties[y] = true;
-
-            // Get all our cells in the page.
-            const page_cells: []const page.Cell = p.getCells(page_rac.row);
-            assert(page_cells.len == self.cols);
-
-            // Copy our raw row data
-            row_rows[y] = page_rac.row.*;
-
-            // Note: our cells MultiArrayList uses our general allocator.
-            // We do this on purpose because as rows become dirty, we do
-            // not want to reallocate space for cells (which are large). This
-            // was a source of huge slowdown.
-            //
-            // Our per-row arena is only used for temporary allocations
-            // pertaining to cells directly (e.g. graphemes, hyperlinks).
-            const cells: *std.MultiArrayList(Cell) = &row_cells[y];
-            try cells.resize(alloc, self.cols);
-
-            // We always copy our raw cell data. In the case we have no
-            // managed memory, we can skip setting any other fields.
-            //
-            // This is an important optimization. For plain-text screens
-            // this ends up being something around 300% faster based on
-            // the `screen-clone` benchmark.
-            const cells_slice = cells.slice();
-            fastmem.copy(
-                page.Cell,
-                cells_slice.items(.raw),
-                page_cells,
-            );
-            if (!page_rac.row.managedMemory()) continue;
-
-            const arena_alloc = arena.allocator();
-            const cells_grapheme = cells_slice.items(.grapheme);
-            const cells_style = cells_slice.items(.style);
-            for (page_cells, 0..) |*page_cell, x| {
-                // Append assuming its a single-codepoint, styled cell
-                // (most common by far).
-                if (page_cell.style_id > 0) cells_style[x] = p.styles.get(
-                    p.memory,
-                    page_cell.style_id,
-                ).*;
-
-                // Switch on our content tag to handle less likely cases.
-                switch (page_cell.content_tag) {
-                    .codepoint => {
-                        @branchHint(.likely);
-                        // Primary codepoint goes into `raw` field.
-                    },
-
-                    // If we have a multi-codepoint grapheme, look it up and
-                    // set our content type.
-                    .codepoint_grapheme => {
-                        @branchHint(.unlikely);
-                        cells_grapheme[x] = try arena_alloc.dupe(
-                            u21,
-                            p.lookupGrapheme(page_cell) orelse &.{},
-                        );
-                    },
-
-                    .bg_color_rgb => {
-                        @branchHint(.unlikely);
-                        cells_style[x] = .{ .bg_color = .{ .rgb = .{
-                            .r = page_cell.content.color_rgb.r,
-                            .g = page_cell.content.color_rgb.g,
-                            .b = page_cell.content.color_rgb.b,
-                        } } };
-                    },
-
-                    .bg_color_palette => {
-                        @branchHint(.unlikely);
-                        cells_style[x] = .{ .bg_color = .{
-                            .palette = page_cell.content.color_palette,
-                        } };
-                    },
-                }
-            }
+            if (try self.updateRow(alloc, y, row_pin, &last_dirty_page, redraw)) any_dirty = true;
         }
+
+        // 3. Next Row (Bottom)
+        {
+            var next_pin: ?PageList.Pin = null;
+            const bl_pin_opt = s.pages.getBottomRight(.viewport);
+            if (bl_pin_opt) |bl_pin| {
+                if (bl_pin.y + 1 < bl_pin.node.data.size.rows) {
+                    var p = bl_pin;
+                    p.y += 1;
+                    next_pin = p;
+                } else if (bl_pin.node.next) |n| {
+                    next_pin = .{ .node = n, .y = 0 };
+                }
+            }
+
+            if (next_pin) |pin| {
+                if (try self.updateRow(alloc, y, pin, &last_dirty_page, redraw)) any_dirty = true;
+            } else {
+                row_data.items(.cells)[y].resize(alloc, 0) catch {};
+                row_data.items(.dirty)[y] = false;
+            }
+            y += 1;
+        }
+
         assert(y == self.rows);
 
-        // If our screen has a selection, then mark the rows with the
-        // selection. We do this outside of the loop above because its unlikely
-        // a selection exists and because the way our selections are structured
-        // today is very inefficient.
-        //
-        // NOTE: To improve the performance of the block below, we'll need
-        // to rethink how we model selections in general.
-        //
-        // There are performance improvements that can be made here, though.
-        // For example, `containedRow` recalculates a bunch of information
-        // we can cache.
         if (s.selection) |*sel| selection: {
             @branchHint(.unlikely);
-
-            // Populate our selection cache to avoid some expensive
-            // recalculation.
             const cache: *const SelectionCache = cache: {
                 if (self.selection_cache) |*c| cache_check: {
-                    // If we're redrawing, we recalculate the cache just to
-                    // be safe.
                     if (redraw) break :cache_check;
-
-                    // If our selection isn't equal, we aren't cached!
                     if (!c.selection.eql(sel.*)) break :cache_check;
-
-                    // If we have no dirty rows, we can not recalculate.
                     if (!any_dirty) break :selection;
-
-                    // We have dirty rows, we can utilize the cache.
                     break :cache c;
                 }
-
-                // Create a new cache
                 const tl_pin = sel.topLeft(s);
                 const br_pin = sel.bottomRight(s);
                 self.selection_cache = .{
@@ -594,21 +557,14 @@ pub const RenderState = struct {
                 };
                 break :cache &self.selection_cache.?;
             };
-
-            // Grab the inefficient data we need from the selection. At
-            // least we can cache it.
             const tl = s.pages.pointFromPin(.screen, cache.tl_pin).?.screen;
             const br = s.pages.pointFromPin(.screen, cache.br_pin).?.screen;
-
-            // We need to determine if our selection is within the viewport.
-            // The viewport is generally very small so the efficient way to
-            // do this is to traverse the viewport pages and check for the
-            // matching selection pages.
             for (
                 row_pins,
                 row_sels,
             ) |pin, *sel_bounds| {
-                const p = s.pages.pointFromPin(.screen, pin).?.screen;
+                // Skip invalid pins (e.g., prev/next rows that don't exist)
+                const p = (s.pages.pointFromPin(.screen, pin) orelse continue).screen;
                 const row_sel = sel.containedRowCached(
                     s,
                     cache.tl_pin,
@@ -627,22 +583,14 @@ pub const RenderState = struct {
             }
         }
 
-        // Handle dirty state.
         if (redraw) {
-            // Fully redraw resets some other state.
             self.screen = t.screens.active_key;
             self.dirty = .full;
-
-            // Note: we don't clear any row_data here because our rebuild
-            // above did this.
         } else if (any_dirty and self.dirty == .false) {
             self.dirty = .partial;
         }
 
-        // Finalize our final dirty page
         if (last_dirty_page) |last_p| last_p.dirty = false;
-
-        // Clear our dirty flags
         t.flags.dirty = .{};
         s.dirty = .{};
     }

@@ -1431,6 +1431,10 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         const region_height = self.scrolling_region.bottom + 1;
         const adjusted_count = @min(count, region_height);
 
+        // Track the scroll for smooth scroll animation (this path bypasses
+        // deleteLines which normally updates scroll_tracker)
+        self.screens.active.scroll_tracker -= @as(isize, @intCast(adjusted_count));
+
         // TODO: Create an optimized version that can scroll N times
         // This isn't critical because in most cases, scrollUp is used
         // with count=1, but it's still a big optimization opportunity.
@@ -1551,6 +1555,7 @@ fn rowWillBeShifted(
 ///
 /// Moves the cursor to the left margin.
 pub fn insertLines(self: *Terminal, count: usize) void {
+    self.screens.active.scroll_tracker += @intCast(count);
     // Rare, but happens
     if (count == 0) return;
 
@@ -1751,6 +1756,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
 ///
 /// Moves the cursor to the left margin.
 pub fn deleteLines(self: *Terminal, count: usize) void {
+    self.screens.active.scroll_tracker -= @intCast(count);
     // Rare, but happens
     if (count == 0) return;
 

@@ -388,6 +388,35 @@ pub const Action = union(Key) {
         charset: charsets.Charset,
     });
 
+    pub const NvimScrollHint = struct {
+        scroll_delta: i32,
+        grid: i32,
+        scroll_top: u32,
+        scroll_bot: u32,
+        scroll_left: u32,
+        scroll_right: u32,
+
+        pub const C = extern struct {
+            scroll_delta: i32,
+            grid: i32,
+            scroll_top: u32,
+            scroll_bot: u32,
+            scroll_left: u32,
+            scroll_right: u32,
+        };
+
+        pub fn cval(self: NvimScrollHint) NvimScrollHint.C {
+            return .{
+                .scroll_delta = self.scroll_delta,
+                .grid = self.grid,
+                .scroll_top = self.scroll_top,
+                .scroll_bot = self.scroll_bot,
+                .scroll_left = self.scroll_left,
+                .scroll_right = self.scroll_right,
+            };
+        }
+    };
+
     pub const ColorOperation = struct {
         op: osc.color.Operation,
         requests: osc.color.List,
@@ -2037,13 +2066,17 @@ pub fn Stream(comptime Handler: type) type {
                     try self.handler.vt(.progress_report, v);
                 },
 
-                .conemu_sleep,
-                .conemu_show_message_box,
-                .conemu_change_tab_title,
-                .conemu_wait_input,
-                .conemu_guimacro,
-                .conemu_comment,
-                .conemu_xterm_emulation,
+                .conemu_sleep, .conemu_show_message_box, .conemu_change_tab_title, .conemu_wait_input, .conemu_guimacro, .conemu_comment, .conemu_xterm_emulation => {},
+
+                .enter_neovim_gui => {
+                    // OSC 1338 - Enter Neovim GUI mode
+                    // Only forward if handler has surface_mailbox (real termio, not inspector)
+                    if (@hasField(@TypeOf(self.handler), "surface_mailbox")) {
+                        log.info("OSC 1338 received - forwarding to surface mailbox", .{});
+                        _ = self.handler.surface_mailbox.push(.enter_neovim_gui, .{ .instant = {} });
+                    }
+                },
+
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,

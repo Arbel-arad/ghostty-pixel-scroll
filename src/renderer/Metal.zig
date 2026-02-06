@@ -263,6 +263,11 @@ pub inline fn presentLastTarget(self: *Metal) !void {
     _ = self;
 }
 
+/// Clear the cached last target. (noop for Metal)
+pub inline fn clearLastTarget(self: *Metal) void {
+    _ = self;
+}
+
 /// Returns the options to use when constructing buffers.
 pub inline fn bufferOptions(self: Metal) bufferpkg.Options {
     return .{

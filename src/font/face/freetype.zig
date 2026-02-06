@@ -343,7 +343,13 @@ pub const Face = struct {
             // SVG glyphs under FreeType, since that requires bundling another
             // dependency to handle rendering the SVG.
             .no_svg = true,
-        }) catch return false;
+        }) catch {
+            // Glyph loading failed.  For fonts that declare color support
+            // (CBDT/CBLC, sbix, COLR), this can happen when no bitmap
+            // strike matches the current size.  The font IS still a color
+            // font -- trust the hasColor() flag as a fallback.
+            return self.face.hasColor();
+        };
 
         const glyph = self.face.handle.*.glyph;
 

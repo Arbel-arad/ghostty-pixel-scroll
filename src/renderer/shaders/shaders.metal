@@ -24,6 +24,33 @@ struct Uniforms {
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
+  float pixel_scroll_offset_y;  // Sub-line scroll offset in pixels
+  float cursor_offset_x;  // Cursor animation X offset in pixels
+  float cursor_offset_y;  // Cursor animation Y offset in pixels
+  // Neovide-style stretchy cursor - 4 corner positions (top-left, top-right, bottom-right, bottom-left)
+  float2 cursor_corner_tl;  // Top-left corner pixel position
+  float2 cursor_corner_tr;  // Top-right corner pixel position
+  float2 cursor_corner_br;  // Bottom-right corner pixel position
+  float2 cursor_corner_bl;  // Bottom-left corner pixel position
+  bool cursor_use_corners;  // Whether to use corner-based rendering
+
+  // Sonicboom VFX
+  float2 sonicboom_center;     // Pixel position of ring center
+  float sonicboom_radius;      // Current ring radius in pixels
+  float sonicboom_thickness;   // Ring thickness in pixels
+  uchar4 sonicboom_color;      // Ring color with alpha
+
+  // TUI smooth scrolling
+  float tui_scroll_offset_y;      // Pixel offset for scroll region cells
+  ushort tui_scroll_region_top;   // Top row of scroll region (inclusive)
+  ushort tui_scroll_region_bottom; // Bottom row of scroll region (inclusive)
+
+  // SDF rounded corners
+  float corner_radius;            // Corner radius in pixels (0 = disabled)
+  uchar4 gap_color;               // Gap color between rounded windows
+  float matte_intensity;          // Matte/ink post-processing (0 = off, 1 = full)
+  uint window_rect_count;         // Number of active window rects
+  float4 window_rects[16];        // Window pixel rects: {x, y, w, h}
 };
 
 //-------------------------------------------------------------------
@@ -448,12 +475,71 @@ fragment float4 bg_image_fragment(
 //-------------------------------------------------------------------
 #pragma mark - Cell BG Shader
 
+struct CellBgData {
+  uchar4 color;
+  short offset_y_fixed;  // 8.8 fixed point Y offset
+  uchar window_id;       // Window index for SDF rounding (0 = none, 1-16 = window)
+  uchar padding;
+};
+
 fragment float4 cell_bg_fragment(
   FullScreenVertexOut in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *cells [[buffer(2)]]
+  constant CellBgData *cells [[buffer(2)]]
 ) {
-  int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
+  // Apply global pixel scroll offset for smooth scrolling (terminal mode)
+  float2 adjusted_pos = in.position.xy;
+  adjusted_pos.y += uniforms.pixel_scroll_offset_y;
+
+  // Apply TUI scroll offset: shift pixels within the scroll region
+  // This makes content in the scroll region slide smoothly while
+  // status bars, headers, etc. outside the region stay fixed.
+  bool in_tui_scroll_region = false;
+  if (uniforms.tui_scroll_offset_y != 0.0) {
+    int2 pre_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+    if (pre_grid_pos.y >= int(uniforms.tui_scroll_region_top) &&
+        pre_grid_pos.y <= int(uniforms.tui_scroll_region_bottom)) {
+      adjusted_pos.y += uniforms.tui_scroll_offset_y;
+      in_tui_scroll_region = true;
+    }
+  }
+
+  int2 grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+
+  // Clamp grid_pos.y to scroll region for shifted pixels so they
+  // don't sample from header/status bar rows
+  if (in_tui_scroll_region) {
+    grid_pos.y = clamp(grid_pos.y, int(uniforms.tui_scroll_region_top), int(uniforms.tui_scroll_region_bottom));
+  }
+  
+  // Apply per-cell offset for per-window smooth scrolling (Neovim GUI mode)
+  if (grid_pos.x >= 0 && grid_pos.x < uniforms.grid_size.x &&
+      grid_pos.y >= 0 && grid_pos.y < uniforms.grid_size.y) {
+    int cell_index = grid_pos.y * uniforms.grid_size.x + grid_pos.x;
+    short per_cell_offset_fixed = cells[cell_index].offset_y_fixed;
+    
+    // Only apply offset to cells that have one (non-zero)
+    // Cells with offset=0 are statuslines/margins - they stay fixed and opaque
+    if (per_cell_offset_fixed != 0) {
+      float per_cell_offset_y = round(float(per_cell_offset_fixed) / 256.0);
+      adjusted_pos.y -= per_cell_offset_y;
+      int2 new_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+      
+      // Check if the new position is a fixed cell (statusline)
+      // If so, don't use that cell's color - keep the original scrolling cell's color
+      if (new_grid_pos.x >= 0 && new_grid_pos.x < uniforms.grid_size.x &&
+          new_grid_pos.y >= 0 && new_grid_pos.y < uniforms.grid_size.y) {
+        int new_cell_index = new_grid_pos.y * uniforms.grid_size.x + new_grid_pos.x;
+        short new_offset_fixed = cells[new_cell_index].offset_y_fixed;
+        
+        // Only use the new position if it's also a scrolling cell (not fixed)
+        if (new_offset_fixed != 0) {
+          grid_pos = new_grid_pos;
+        }
+        // If new cell is fixed (offset=0), keep original grid_pos
+      }
+    }
+  }
 
   float4 bg = float4(0.0);
 
@@ -473,35 +559,131 @@ fragment float4 cell_bg_fragment(
   }
 
   // Clamp y position if we should extend, otherwise discard if out of bounds.
+  // When pixel_scroll_offset_y is non-zero (smooth scrolling active), always clamp
+  // to ensure we fill edges with content from extra rows instead of black.
+  bool scrolling = uniforms.pixel_scroll_offset_y != uniforms.cell_size.y;
   if (grid_pos.y < 0) {
-    if (uniforms.padding_extend & EXTEND_UP) {
+    if (scrolling || (uniforms.padding_extend & EXTEND_UP)) {
       grid_pos.y = 0;
     } else {
       return bg;
     }
   } else if (grid_pos.y > uniforms.grid_size.y - 1) {
-    if (uniforms.padding_extend & EXTEND_DOWN) {
+    if (scrolling || (uniforms.padding_extend & EXTEND_DOWN)) {
       grid_pos.y = uniforms.grid_size.y - 1;
     } else {
       return bg;
     }
   }
 
-  // Load the color for the cell.
-  uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
+  // Load the color for the cell from the struct
+  int cell_index_final = grid_pos.y * uniforms.grid_size.x + grid_pos.x;
+  uchar4 cell_color = cells[cell_index_final].color;
+  uchar cell_window_id = cells[cell_index_final].window_id;
+  
+  // Force alpha to 255 - backgrounds should always be opaque
+  // This prevents transparency issues during smooth scrolling
+  cell_color.a = 255;
 
   // Convert the color and return it.
-  //
-  // TODO: It might be a good idea to do a pass before this
-  //       to convert all of the bg colors, so we don't waste
-  //       a bunch of work converting the cell color in every
-  //       fragment of each cell. It's not the most epxensive
-  //       operation, but it is still wasted work.
-  return load_color(
+  float4 result = load_color(
     cell_color,
     uniforms.use_display_p3,
     uniforms.use_linear_blending
   );
+
+  // SDF Rounded Corners: apply rounded rectangle clipping per-window
+  if (uniforms.corner_radius > 0.0 && cell_window_id > 0 &&
+      cell_window_id <= uniforms.window_rect_count) {
+    float4 wrect = uniforms.window_rects[cell_window_id - 1];
+    float2 win_pos = wrect.xy;
+    float2 win_size = wrect.zw;
+
+    // Position relative to window center
+    float2 frag_pos = in.position.xy;
+    float2 center = win_pos + win_size * 0.5;
+    float2 half_size = win_size * 0.5;
+    float r = uniforms.corner_radius;
+
+    // SDF for rounded rectangle: distance from point to nearest edge
+    float2 d = abs(frag_pos - center) - half_size + float2(r);
+    float dist = length(max(d, float2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+
+    // Anti-aliased edge: smoothstep over ~1.5px for crisp AA
+    float alpha = 1.0 - smoothstep(-1.0, 0.5, dist);
+
+    // Outside the rounded rect: show the gap color
+    if (alpha < 1.0) {
+      float4 gap_bg = load_color(
+        uniforms.gap_color,
+        uniforms.use_display_p3,
+        uniforms.use_linear_blending
+      );
+      result = mix(gap_bg, result, alpha);
+    }
+  }
+
+  // Matte/ink color post-processing
+  if (uniforms.matte_intensity > 0.0) {
+    float t = uniforms.matte_intensity;
+
+    // Work in gamma space for perceptual correctness
+    float4 color_gamma = uniforms.use_linear_blending ? unlinearize(result) : result;
+
+    // 1. Slight desaturation (5-15% scaled by intensity) - makes colors less "digital"
+    float lum = dot(color_gamma.rgb, float3(0.2126, 0.7152, 0.0722));
+    color_gamma.rgb = mix(color_gamma.rgb, float3(lum), 0.12 * t);
+
+    // 2. Shadow lift + highlight compression - gives "matte" feel
+    //    No real surface is pure black or pure white
+    float lift = 0.02 * t;      // Lift shadows slightly
+    float compress = 0.97 + 0.03 * (1.0 - t);  // Compress highlights
+    color_gamma.rgb = color_gamma.rgb * compress + float3(lift);
+
+    // 3. Cool-tint shadows - subtle blue shift in dark areas
+    //    Gives the "designed" look of Linear/Vercel/Arc
+    float shadow_strength = (1.0 - lum) * t;
+    color_gamma.rgb += float3(-0.003, -0.001, 0.008) * shadow_strength;
+
+    // Clamp to valid range
+    color_gamma.rgb = saturate(color_gamma.rgb);
+
+    result = uniforms.use_linear_blending ? linearize(color_gamma) : color_gamma;
+    result.a = 1.0;  // Ensure fully opaque after processing
+  }
+
+  // Sonicboom VFX: expanding double ring explosion
+  if (uniforms.sonicboom_color.a > 0 && uniforms.sonicboom_radius > 0.0) {
+    float2 frag_pos = in.position.xy;
+    float dist = length(frag_pos - uniforms.sonicboom_center);
+    
+    // Primary expanding ring
+    float ring_inner = uniforms.sonicboom_radius - uniforms.sonicboom_thickness;
+    float ring_outer = uniforms.sonicboom_radius + uniforms.sonicboom_thickness;
+    float ring1 = smoothstep(ring_inner - 2.0, ring_inner + 1.0, dist) *
+                  (1.0 - smoothstep(ring_outer - 1.0, ring_outer + 2.0, dist));
+    
+    // Secondary ring at 70% radius for double shockwave effect
+    float ring2_radius = uniforms.sonicboom_radius * 0.7;
+    float ring2_inner = ring2_radius - uniforms.sonicboom_thickness * 0.6;
+    float ring2_outer = ring2_radius + uniforms.sonicboom_thickness * 0.6;
+    float ring2 = smoothstep(ring2_inner - 1.5, ring2_inner + 0.5, dist) *
+                  (1.0 - smoothstep(ring2_outer - 0.5, ring2_outer + 1.5, dist));
+
+    float combined = max(ring1, ring2 * 0.5);
+
+    if (combined > 0.001) {
+      float4 boom_color = load_color(
+        uniforms.sonicboom_color,
+        uniforms.use_display_p3,
+        uniforms.use_linear_blending
+      );
+      float alpha = boom_color.a * combined;
+      result = mix(result, float4(boom_color.rgb, 1.0), alpha);
+    }
+  }
+
+  return result;
 }
 
 //-------------------------------------------------------------------
@@ -543,6 +725,9 @@ struct CellTextVertexIn {
 
   // Misc properties of the glyph.
   uint8_t bools [[attribute(6)]];
+
+  // Per-cell pixel Y offset for smooth scrolling (8.8 fixed-point format)
+  short pixel_offset_y_fixed [[attribute(7)]];
 };
 
 struct CellTextVertexOut {
@@ -550,7 +735,10 @@ struct CellTextVertexOut {
   uint8_t atlas [[flat]];
   float4 color [[flat]];
   float4 bg_color [[flat]];
+  short pixel_offset_y [[flat]];  // For statusline clipping
+  ushort2 grid_pos [[flat]];  // Original grid position for TUI scroll clipping
   float2 tex_coord;
+  float2 screen_pos;  // For clipping during scroll
 };
 
 vertex CellTextVertexOut cell_text_vertex(
@@ -617,8 +805,61 @@ vertex CellTextVertexOut cell_text_vertex(
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
   cell_pos = cell_pos + size * corner + offset;
+  
+  // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
+  // Round to whole pixels so all glyphs jump simultaneously (no inter-line shimmer).
+  // Backgrounds use the fractional offset for smooth sub-pixel sliding.
+  float per_cell_offset_y = round(float(in.pixel_offset_y_fixed) / 256.0f);
+  cell_pos.y += per_cell_offset_y;
+
+  // Apply TUI scroll offset for cells within the scroll region
+  if (uniforms.tui_scroll_offset_y != 0.0 &&
+      in.grid_pos.y >= uniforms.tui_scroll_region_top &&
+      in.grid_pos.y <= uniforms.tui_scroll_region_bottom) {
+    cell_pos.y += uniforms.tui_scroll_offset_y;
+  }
+  
+  // Apply global pixel scroll offset for smooth scrolling
+  cell_pos.y -= uniforms.pixel_scroll_offset_y;
+
+  // Snap text glyph Y position to nearest integer pixel to prevent shimmer/blur
+  // during smooth scrolling. Backgrounds still scroll at sub-pixel precision for
+  // visual smoothness, but text must be pixel-aligned since glyph atlases use
+  // nearest-neighbor sampling and were rasterized at integer positions.
+  cell_pos.y = round(cell_pos.y);
+  
+  // Apply cursor animation for cursor glyph
+  if ((in.bools & IS_CURSOR_GLYPH) != 0) {
+    if (uniforms.cursor_use_corners) {
+      // Neovide-style stretchy cursor: each vertex uses its animated corner position
+      // The corner_cursor animation provides absolute pixel positions for each corner.
+      // Vertex order in quad: vid 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+      // Corner order from Zig: [0]=TL, [1]=TR, [2]=BR, [3]=BL
+      float2 corner_pos;
+      if (vid == 0) {
+        corner_pos = uniforms.cursor_corner_tl;  // corners[0]
+      } else if (vid == 1) {
+        corner_pos = uniforms.cursor_corner_tr;  // corners[1]
+      } else if (vid == 2) {
+        corner_pos = uniforms.cursor_corner_bl;  // corners[3]
+      } else {
+        corner_pos = uniforms.cursor_corner_br;  // corners[2]
+      }
+      // corner_pos is already the final vertex position in pixels
+      // Just use it directly (no additional offset/size needed)
+      cell_pos = corner_pos;
+    } else {
+      // Simple offset-based animation (fallback)
+      cell_pos.x += uniforms.cursor_offset_x;
+      cell_pos.y += uniforms.cursor_offset_y;
+    }
+  }
   out.position =
       uniforms.projection_matrix * float4(cell_pos.x, cell_pos.y, 0.0f, 1.0f);
+  
+  // Pass screen position for edge clipping in fragment shader
+  out.screen_pos = cell_pos;
+  out.grid_pos = in.grid_pos;
 
   // Calculate the texture coordinate in pixels. This is NOT normalized
   // (between 0.0 and 1.0), and does not need to be, since the texture will
@@ -646,6 +887,9 @@ vertex CellTextVertexOut cell_text_vertex(
     true
   );
   out.bg_color += global_bg * (1.0 - out.bg_color.a);
+  
+  // Pass pixel offset for statusline clipping in fragment shader
+  out.pixel_offset_y = in.pixel_offset_y_fixed;
 
   // If we have a minimum contrast, we need to check if we need to
   // change the color of the text to ensure it has enough contrast
@@ -679,8 +923,78 @@ fragment float4 cell_text_fragment(
   CellTextVertexOut in [[stage_in]],
   texture2d<float> textureGrayscale [[texture(0)]],
   texture2d<float> textureColor [[texture(1)]],
-  constant Uniforms& uniforms [[buffer(1)]]
+  constant Uniforms& uniforms [[buffer(1)]],
+  constant CellBgData *bg_cells [[buffer(2)]]
 ) {
+  // Check if this fragment is scrolling text that landed in a fixed cell (statusline)
+  // Only clip if: this text HAS an offset AND lands in a cell with offset=0
+  if (in.pixel_offset_y != 0) {
+    float2 adjusted_pos = in.position.xy;
+    adjusted_pos.y += uniforms.pixel_scroll_offset_y;
+    int2 dest_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+    
+    if (dest_grid_pos.x >= 0 && dest_grid_pos.x < uniforms.grid_size.x &&
+        dest_grid_pos.y >= 0 && dest_grid_pos.y < uniforms.grid_size.y) {
+      int cell_index = dest_grid_pos.y * uniforms.grid_size.x + dest_grid_pos.x;
+      short dest_offset = bg_cells[cell_index].offset_y_fixed;
+      
+      // If dest cell is fixed (offset=0) but this text has offset, clip it
+      if (dest_offset == 0) {
+        discard_fragment();
+      }
+    }
+  }
+  
+  // Clip TUI scrolling text at scroll region boundaries
+  // When tui_scroll_offset_y is active, text within the scroll region may
+  // slide into the fixed header/status rows. Clip fragments that land outside
+  // the scroll region pixel bounds.
+  if (uniforms.tui_scroll_offset_y != 0.0) {
+    float2 adj = in.position.xy;
+    adj.y += uniforms.pixel_scroll_offset_y;
+    int2 frag_grid = int2(floor((adj - uniforms.grid_padding.wx) / uniforms.cell_size));
+    // Check if the grid_pos (original row) is within the scroll region
+    // but the fragment landed outside it
+    if (in.grid_pos.y >= uniforms.tui_scroll_region_top &&
+        in.grid_pos.y <= uniforms.tui_scroll_region_bottom) {
+      if (frag_grid.y < int(uniforms.tui_scroll_region_top) ||
+          frag_grid.y > int(uniforms.tui_scroll_region_bottom)) {
+        discard_fragment();
+      }
+    }
+  }
+
+  // SDF Rounded Corners: clip text fragments that fall outside rounded rect
+  if (uniforms.corner_radius > 0.0) {
+    // Look up window_id from bg cell data
+    int2 text_grid = int2(in.grid_pos);
+    if (text_grid.x >= 0 && text_grid.x < uniforms.grid_size.x &&
+        text_grid.y >= 0 && text_grid.y < uniforms.grid_size.y) {
+      int ci = text_grid.y * uniforms.grid_size.x + text_grid.x;
+      uchar wid = bg_cells[ci].window_id;
+      if (wid > 0 && wid <= uniforms.window_rect_count) {
+        float4 wrect = uniforms.window_rects[wid - 1];
+        float2 win_pos = wrect.xy;
+        float2 win_size = wrect.zw;
+        float2 center = win_pos + win_size * 0.5;
+        float2 half_size = win_size * 0.5;
+        float r = uniforms.corner_radius;
+        float2 d = abs(in.position.xy - center) - half_size + float2(r);
+        float dist = length(max(d, float2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+        if (dist > 0.0) {
+          discard_fragment();
+        }
+      }
+    }
+  }
+
+  // Legacy clip for terminal scrollback
+  float grid_top = uniforms.grid_padding.x;
+  float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;
+  if (in.screen_pos.y < grid_top || in.screen_pos.y > grid_bottom) {
+    discard_fragment();
+  }
+
   constexpr sampler textureSampler(
     coord::pixel,
     address::clamp_to_edge,
@@ -706,6 +1020,22 @@ fragment float4 cell_text_fragment(
 
       // Fetch our alpha mask for this pixel.
       float a = textureGrayscale.sample(textureSampler, in.tex_coord).r;
+
+      // Text gamma/contrast adjustment (matches Neovide's text_gamma/text_contrast).
+      // Gamma: adjusts overall glyph weight. Positive = thicker, negative = thinner.
+      // Contrast: sharpens glyph edges by steepening the alpha curve.
+      if (uniforms.text_gamma != 0.0 || uniforms.text_contrast != 0.0) {
+        // Gamma: remap alpha through pow curve
+        if (uniforms.text_gamma != 0.0) {
+          float gamma_exp = 1.0 / (1.0 + uniforms.text_gamma);
+          a = pow(a, gamma_exp);
+        }
+        // Contrast: steepen alpha around 0.5 midpoint
+        if (uniforms.text_contrast > 0.0) {
+          float k = 1.0 + uniforms.text_contrast * 4.0; // 0→1, 4→5
+          a = clamp((a - 0.5) * k + 0.5, 0.0, 1.0);
+        }
+      }
 
       // Linear blending weight correction corrects the alpha value to
       // produce blending results which match gamma-incorrect blending.
@@ -822,6 +1152,8 @@ vertex ImageVertexOut image_vertex(
   // adds the source rect width/height components.
   float2 image_pos = (uniforms.cell_size * in.grid_pos) + in.cell_offset;
   image_pos += in.dest_size * corner;
+  // Apply pixel scroll offset for smooth scrolling
+  image_pos.y -= uniforms.pixel_scroll_offset_y;
 
   out.position =
       uniforms.projection_matrix * float4(image_pos.x, image_pos.y, 0.0f, 1.0f);

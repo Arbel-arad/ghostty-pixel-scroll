@@ -249,6 +249,14 @@ pub fn displayRealized(self: *const OpenGL) void {
     }
 }
 
+/// Called when the display is about to be unrealized (e.g., during window
+/// moves between displays or hy3 layout changes). We clear last_target since
+/// the framebuffer will be destroyed and would be invalid after realize.
+pub fn displayUnrealized(self: *OpenGL) void {
+    // Clear the cached target since the framebuffer will be destroyed
+    self.last_target = null;
+}
+
 /// Actions taken before doing anything in `drawFrame`.
 ///
 /// Right now there's nothing we need to do for OpenGL.
@@ -333,6 +341,12 @@ pub fn present(self: *OpenGL, target: Target) !void {
 /// Present the last presented target again.
 pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);
+}
+
+/// Clear the cached last target. This should be called when the surface
+/// size changes to prevent stale buffer blits.
+pub fn clearLastTarget(self: *OpenGL) void {
+    self.last_target = null;
 }
 
 /// Returns the options to use when constructing buffers.

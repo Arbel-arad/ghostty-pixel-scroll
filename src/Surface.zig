@@ -36,6 +36,7 @@ const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
+const neovim_gui = @import("neovim_gui/main.zig");
 
 const log = std.log.scoped(.surface);
 
@@ -122,6 +123,10 @@ io_thr: std.Thread,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
+
+/// Neovim GUI mode - when set, this surface acts as a Neovim GUI client
+/// instead of a terminal emulator
+nvim_gui: ?*neovim_gui.NeovimGui = null,
 
 /// All our sizing information.
 size: rendererpkg.Size,
@@ -244,6 +249,11 @@ const Mouse = struct {
     pending_scroll_x: f64 = 0,
     pending_scroll_y: f64 = 0,
 
+    /// Current pixel scroll offset for smooth scrolling. This is the sub-line
+    /// offset in pixels (0 to cell_height). Positive means user scrolled up
+    /// into history so content should shift up.
+    pixel_scroll_offset: f64 = 0,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -312,6 +322,7 @@ const DerivedConfig = struct {
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
+    pixel_scroll: bool,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
     selection_clear_on_copy: bool,
@@ -335,6 +346,7 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    neovim_gui_socket: ?[]const u8,
 
     const Link = struct {
         regex: oni.Regex,
@@ -389,6 +401,7 @@ const DerivedConfig = struct {
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
+            .pixel_scroll = config.@"pixel-scroll",
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
             .selection_clear_on_copy = config.@"selection-clear-on-copy",
@@ -412,6 +425,10 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            .neovim_gui_socket = if (config.@"neovim-gui".len > 0)
+                try alloc.dupe(u8, config.@"neovim-gui")
+            else
+                null,
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -772,6 +789,13 @@ pub fn init(
 
     // We are no longer the first surface
     app.first = false;
+
+    // Initialize Neovim GUI mode if configured
+    if (derived_config.neovim_gui_socket != null) {
+        self.initNeovimGui() catch |err| {
+            log.warn("Failed to initialize Neovim GUI mode: {}", .{err});
+        };
+    }
 }
 
 pub fn deinit(self: *Surface) void {
@@ -807,6 +831,11 @@ pub fn deinit(self: *Surface) void {
         self.alloc.destroy(v);
     }
 
+    // Clean up Neovim GUI if active
+    if (self.nvim_gui) |nvim| {
+        nvim.deinit();
+    }
+
     // Clean up our keyboard state
     for (self.keyboard.sequence_queued.items) |req| req.deinit();
     self.keyboard.sequence_queued.deinit(self.alloc);
@@ -827,6 +856,108 @@ pub fn deinit(self: *Surface) void {
 /// close process, which should ultimately deinitialize this surface.
 pub fn close(self: *Surface) void {
     self.rt_surface.close(self.needsConfirmQuit());
+}
+
+/// Check if this surface is in Neovim GUI mode
+pub fn isNeovimGuiMode(self: *const Surface) bool {
+    return self.nvim_gui != null;
+}
+
+/// Initialize Neovim GUI mode for this surface
+/// This should be called after Surface.init if neovim-gui config is set
+/// or when OSC 1338 is received
+pub fn initNeovimGui(self: *Surface) !void {
+    // If called from OSC 1338, use spawn mode. Otherwise use config.
+    const socket_path = self.config.neovim_gui_socket orelse "spawn";
+
+    log.info("Initializing Neovim GUI mode with socket: {s}", .{socket_path});
+
+    const nvim = try neovim_gui.NeovimGui.init(self.alloc);
+    errdefer nvim.deinit();
+
+    // Set initial grid size based on terminal size
+    // Note: We use the exact terminal grid size. Neovim handles its own
+    // statusline, cmdline, tabline within this space.
+    //
+    // IMPORTANT: Calculate grid size using ONLY explicit padding, not balanced padding.
+    // Balanced padding adds extra padding to center content, but for Neovim we want
+    // to use all available rows. Neovim handles its own layout.
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    const x_dpi = content_scale.x * font.face.default_dpi;
+    const y_dpi = content_scale.y * font.face.default_dpi;
+    const explicit_padding = self.config.scaledPadding(x_dpi, y_dpi);
+
+    // Calculate grid with only explicit padding (not balanced)
+    const screen_without_balanced = self.size.screen.subPadding(explicit_padding);
+    const grid_size = rendererpkg.GridSize.init(screen_without_balanced, self.size.cell);
+
+    log.info("initNeovimGui: screen={}x{} explicit_padding=({},{},{},{}) balanced_padding=({},{},{},{}) cell={}x{} grid={}x{}", .{
+        self.size.screen.width,
+        self.size.screen.height,
+        explicit_padding.top,
+        explicit_padding.bottom,
+        explicit_padding.left,
+        explicit_padding.right,
+        self.size.padding.top,
+        self.size.padding.bottom,
+        self.size.padding.left,
+        self.size.padding.right,
+        self.size.cell.width,
+        self.size.cell.height,
+        grid_size.columns,
+        grid_size.rows,
+    });
+    nvim.grid_width = grid_size.columns;
+    nvim.grid_height = grid_size.rows;
+    nvim.cell_width = @floatFromInt(self.size.cell.width);
+    nvim.cell_height = @floatFromInt(self.size.cell.height);
+
+    // Get the current working directory from the terminal
+    const terminal_cwd = self.io.terminal.getPwd();
+
+    // Connect based on mode:
+    // - "embed" - spawn nvim --embed (direct pipe communication, loads user config)
+    // - "spawn" - spawn nvim --listen on temp socket then connect (best experience)
+    // - any path - connect to existing Neovim socket
+    if (std.mem.eql(u8, socket_path, "embed")) {
+        try nvim.spawn(terminal_cwd);
+    } else if (std.mem.eql(u8, socket_path, "spawn")) {
+        try nvim.spawnWithSocket(terminal_cwd);
+    } else {
+        try nvim.connect(socket_path);
+    }
+
+    self.nvim_gui = nvim;
+
+    // Set the nvim_gui pointer on the renderer state so it can render from Neovim
+    self.renderer_state.nvim_gui = nvim;
+
+    // Wire up the render wakeup for zero-latency rendering
+    // When Neovim sends a flush event, the I/O thread will directly wake up the renderer
+    const WakeupType = @TypeOf(self.renderer_thread.wakeup);
+    nvim.setRenderWakeup(
+        @ptrCast(&self.renderer_thread.wakeup),
+        struct {
+            fn notify(ptr: *anyopaque) void {
+                const wakeup: *WakeupType = @ptrCast(@alignCast(ptr));
+                wakeup.notify() catch {};
+            }
+        }.notify,
+    );
+
+    log.info("Neovim GUI mode initialized successfully", .{});
+}
+
+/// Send a key event to Neovim (when in GUI mode)
+pub fn sendKeyToNeovim(self: *Surface, event: input.KeyEvent) !void {
+    const nvim = self.nvim_gui orelse return;
+
+    // Convert the Ghostty key event to Neovim notation
+    if (neovim_gui.nvim_input.toNeovimKey(event)) |key_str| {
+        try nvim.sendKey(key_str);
+        // Queue a render to show the response from Neovim ASAP
+        try self.queueRender();
+    }
 }
 
 /// Returns a mailbox that can be used to send messages to this surface.
@@ -1149,6 +1280,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .search_selected,
                 .{ .selected = v },
             );
+        },
+
+        .enter_neovim_gui => {
+            // OSC 1338 - Enter Neovim GUI mode dynamically
+            if (self.nvim_gui == null and self.config.neovim_gui_socket == null) {
+                log.info("entering Neovim GUI mode via OSC 1338", .{});
+                self.config.neovim_gui_socket = "spawn";
+                self.initNeovimGui() catch |err| {
+                    log.err("failed to init Neovim GUI: {}", .{err});
+                };
+            }
         },
     }
 }
@@ -2448,6 +2590,7 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // We have to update the IO thread no matter what because we send
     // pixel-level sizing to the subprocess.
     const grid_size = self.size.grid();
+
     if (grid_size.columns < 5 and (self.size.padding.left > 0 or self.size.padding.right > 0)) {
         log.warn("WARNING: very small terminal grid detected with padding " ++
             "set. Is your padding reasonable?", .{});
@@ -2457,6 +2600,40 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
             "set. Is your padding reasonable?", .{});
     }
 
+    log.debug("surface resize: screen={}x{}px cell={}x{}px grid={}x{}", .{
+        self.size.screen.width,
+        self.size.screen.height,
+        self.size.cell.width,
+        self.size.cell.height,
+        grid_size.columns,
+        grid_size.rows,
+    });
+
+    // If in Neovim GUI mode, resize the Neovim UI
+    if (self.nvim_gui) |nvim| {
+        // Calculate grid size using ONLY explicit padding for Neovim
+        // This ensures Neovim gets all available rows, not reduced by balanced padding
+        const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+        const x_dpi = content_scale.x * font.face.default_dpi;
+        const y_dpi = content_scale.y * font.face.default_dpi;
+        const explicit_padding = self.config.scaledPadding(x_dpi, y_dpi);
+        const screen_without_balanced = self.size.screen.subPadding(explicit_padding);
+        const nvim_grid_size = rendererpkg.GridSize.init(screen_without_balanced, self.size.cell);
+
+        log.debug("nvim resize: grid {}x{}", .{
+            nvim_grid_size.columns,
+            nvim_grid_size.rows,
+        });
+        nvim.resize(
+            nvim_grid_size.columns,
+            nvim_grid_size.rows,
+            @floatFromInt(self.size.cell.width),
+            @floatFromInt(self.size.cell.height),
+        ) catch |err| {
+            log.warn("Failed to resize Neovim UI: {}", .{err});
+        };
+    }
+
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
 }
@@ -2464,6 +2641,11 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (!self.config.window_padding_balance) return;
+
+    // Skip balanced padding for Neovim mode - we want to use the full grid space
+    // Neovim handles its own layout (tabline, statusline, etc.)
+    if (self.nvim_gui != null) return;
+
     const content_scale = try self.rt_surface.getContentScale();
     const x_dpi = content_scale.x * font.face.default_dpi;
     const y_dpi = content_scale.y * font.face.default_dpi;
@@ -2651,6 +2833,32 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    // If we're in Neovim GUI mode, check if Neovim exited first
+    if (self.nvim_gui) |nvim| {
+        // Check if Neovim process exited (:q, :qall, etc.)
+        if (nvim.exited) {
+            log.info("Neovim exited - cleaning up GUI mode and switching to terminal", .{});
+            // Clean up Neovim GUI
+            nvim.deinit();
+            self.nvim_gui = null;
+            self.renderer_state.nvim_gui = null;
+            self.config.neovim_gui_socket = null; // Allow re-entering GUI mode
+
+            // Reset cursor blink state so it starts animating again
+            _ = self.renderer_thread.mailbox.push(.reset_cursor_blink, .{ .instant = {} });
+
+            try self.queueRender();
+
+            // Consume this key event - the terminal will show fresh on next frame
+            return .consumed;
+        } else {
+            // Route key to Neovim
+            try self.sendKeyToNeovim(event);
+            return .consumed;
+        }
+    }
+
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lock();
@@ -3386,10 +3594,73 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
-    const y: ScrollAmount = if (yoff == 0) .{} else y: {
-        // We use cell_size to determine if we have accumulated enough to trigger a scroll
-        const cell_size: f64 = @floatFromInt(self.size.cell.height);
+    // In Neovim GUI mode, send scroll events to Neovim using nvim_input_mouse
+    // This properly targets the window under the cursor (like Neovide)
+    if (self.nvim_gui) |nvim| {
+        if (yoff != 0) {
+            // Get cursor position for scroll event
+            const pos = try self.rt_surface.getCursorPos();
+            const cell_w: f64 = @floatFromInt(self.size.cell.width);
+            const cell_h: f64 = @floatFromInt(self.size.cell.height);
+            const screen_col: f32 = @floatCast(@max(0, pos.x) / cell_w);
+            const screen_row: f32 = @floatCast(@max(0, pos.y) / cell_h);
 
+            // Find the window under the cursor and get local grid position
+            const window_info = nvim.findWindowAtPosition(screen_col, screen_row);
+
+            // Normalize yoff to lines. For precision scroll (touchpad), yoff is in pixels,
+            // so divide by cell height to get lines. For discrete scroll (mouse wheel),
+            // yoff is already in line-like units.
+            const yoff_lines: f64 = if (scroll_mods.precision)
+                yoff / cell_h
+            else
+                yoff;
+
+            // Accumulate scroll for smoother mouse wheel handling
+            self.mouse.pending_scroll_y += yoff_lines;
+
+            // Send scroll events to Neovim using nvim_input_mouse API
+            // This targets the specific grid (window) under the cursor
+            // Note: yoff positive = scroll up in Neovim's convention
+            while (self.mouse.pending_scroll_y >= 1.0) {
+                self.mouse.pending_scroll_y -= 1.0;
+                if (window_info) |info| {
+                    nvim.sendScroll("up", info.grid_id, info.col, info.row) catch {};
+                } else {
+                    // Fallback to grid 1 if no window found
+                    const col: u64 = @intFromFloat(screen_col);
+                    const row: u64 = @intFromFloat(screen_row);
+                    nvim.sendScroll("up", 1, col, row) catch {};
+                }
+            }
+            while (self.mouse.pending_scroll_y <= -1.0) {
+                self.mouse.pending_scroll_y += 1.0;
+                if (window_info) |info| {
+                    nvim.sendScroll("down", info.grid_id, info.col, info.row) catch {};
+                } else {
+                    // Fallback to grid 1 if no window found
+                    const col: u64 = @intFromFloat(screen_col);
+                    const row: u64 = @intFromFloat(screen_row);
+                    nvim.sendScroll("down", 1, col, row) catch {};
+                }
+            }
+        }
+        try self.queueRender();
+        return;
+    }
+
+    // We use cell height to determine if we have accumulated enough to trigger a scroll
+    const cell_height: f64 = @floatFromInt(self.size.cell.height);
+
+    // Track if we should use pixel scrolling. Only enabled for precision devices
+    // (touchpads) when the config option is on and we're not in mouse reporting mode.
+    // When mouse reporting is active (TUI apps), we need line-based scroll events.
+    const mouse_reporting_active = self.config.mouse_reporting and
+        self.io.terminal.flags.mouse_event != .none;
+    const use_pixel_scroll = self.config.pixel_scroll and scroll_mods.precision and
+        !mouse_reporting_active;
+
+    const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // If we have precision scroll, yoff is the number of pixels to scroll. In non-precision
         // scroll, yoff is the number of wheel ticks. Some mice are capable of reporting fractional
         // wheel ticks, which don't necessarily get reported as precision scrolls. We normalize all
@@ -3410,8 +3681,13 @@ pub fn scrollCallback(
             else
                 @min(yoff, -1);
 
-            break :yoff_adjusted yoff_max * cell_size * self.config.mouse_scroll_multiplier.discrete;
+            break :yoff_adjusted yoff_max * cell_height * self.config.mouse_scroll_multiplier.discrete;
         };
+
+        // For pixel scrolling, we handle this differently below
+        if (use_pixel_scroll) {
+            break :y .{};
+        }
 
         // Add our previously saved pending amount to the offset to get the
         // new offset value. The signs of the pending and yoff should match
@@ -3422,15 +3698,15 @@ pub fn scrollCallback(
 
         // If the new offset is less than a single unit of scroll, we save
         // the new pending value and do not scroll yet.
-        if (@abs(poff) < cell_size) {
+        if (@abs(poff) < cell_height) {
             self.mouse.pending_scroll_y = poff;
             break :y .{};
         }
 
         // We scroll by the number of rows in the offset and save the remainder
-        const amount = poff / cell_size;
+        const amount = poff / cell_height;
         assert(@abs(amount) >= 1);
-        self.mouse.pending_scroll_y = poff - (amount * cell_size);
+        self.mouse.pending_scroll_y = poff - (amount * cell_height);
 
         // Round towards zero.
         const delta: isize = @intFromFloat(@trunc(amount));
@@ -3514,19 +3790,21 @@ pub fn scrollCallback(
 
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
+            // Invert for TUI apps: the mouse protocol button 4/5 convention
+            // is opposite to what natural scroll produces, so we swap them.
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 try self.mouseReport(switch (y.direction()) {
-                    .up_right => .four,
-                    .down_left => .five,
+                    .up_right => .five,
+                    .down_left => .four,
                 }, .press, self.mouse.mods, pos);
             }
 
             for (0..@abs(x.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 try self.mouseReport(switch (x.direction()) {
-                    .up_right => .six,
-                    .down_left => .seven,
+                    .up_right => .seven,
+                    .down_left => .six,
                 }, .press, self.mouse.mods, pos);
             }
 
@@ -3535,11 +3813,75 @@ pub fn scrollCallback(
             return;
         }
 
-        if (y.delta != 0) {
+        if (use_pixel_scroll and yoff != 0) {
+            // Neovide-style smooth scrolling:
+            // 1. Scroll terminal viewport immediately
+            // 2. Set scroll_delta_lines so renderer can animate visually
+            // 3. Renderer animates from old position to new position
+
+            const yoff_adjusted = yoff * self.config.mouse_scroll_multiplier.precision;
+
+            // Check if we can scroll
+            const is_main_screen = self.io.terminal.screens.active_key == .primary;
+            const screen_pages = &self.io.terminal.screens.active.pages;
+            const has_history = screen_pages.total_rows > screen_pages.rows;
+
+            if (is_main_screen and has_history) {
+                // Accumulate pixel offset (negative yoff = scroll down = positive offset)
+                self.mouse.pixel_scroll_offset -= yoff_adjusted;
+
+                // Only scroll terminal when we've accumulated a full line
+                const max_scroll_rows = screen_pages.total_rows -| screen_pages.rows;
+                const current_vp_offset: f64 = switch (screen_pages.viewport) {
+                    .active => 0,
+                    .top => @floatFromInt(max_scroll_rows),
+                    .pin => blk: {
+                        const offset = screen_pages.viewport_pin_row_offset orelse 0;
+                        break :blk @floatFromInt(max_scroll_rows -| offset);
+                    },
+                };
+
+                // Total visual scroll in lines
+                const total_scroll_lines = current_vp_offset + (self.mouse.pixel_scroll_offset / cell_height);
+
+                // Clamp visual scroll to valid range
+                if (total_scroll_lines < 0) {
+                    // Hit bottom - clamp offset
+                    self.mouse.pixel_scroll_offset = -current_vp_offset * cell_height;
+                } else if (total_scroll_lines > @as(f64, @floatFromInt(max_scroll_rows))) {
+                    // Hit top - clamp offset
+                    self.mouse.pixel_scroll_offset = (@as(f64, @floatFromInt(max_scroll_rows)) - current_vp_offset) * cell_height;
+                }
+
+                // Scroll terminal viewport to keep content loaded
+                // Scroll when offset crosses line boundaries
+                // Keep offset in range [0, cell_height) for upward scroll (into history)
+                // and (-cell_height, 0] for downward scroll (toward active)
+                while (self.mouse.pixel_scroll_offset >= cell_height) {
+                    self.mouse.pixel_scroll_offset -= cell_height;
+                    try self.io.terminal.scrollViewport(.{ .delta = -1 });
+                }
+                while (self.mouse.pixel_scroll_offset < 0) {
+                    self.mouse.pixel_scroll_offset += cell_height;
+                    try self.io.terminal.scrollViewport(.{ .delta = 1 });
+                }
+
+                // Update renderer state
+                self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
+            } else {
+                self.mouse.pixel_scroll_offset = 0;
+                self.renderer_state.mouse.pixel_scroll_offset_y = 0;
+            }
+        } else if (y.delta != 0) {
+            // Line-based scrolling mode
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
             try self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+
+            // Reset pixel scroll offset when using line-based scrolling
+            self.mouse.pixel_scroll_offset = 0;
+            self.renderer_state.mouse.pixel_scroll_offset_y = 0;
         }
     }
 
@@ -3886,6 +4228,94 @@ pub fn mouseButtonCallback(
 
     // Update our modifiers if they changed
     self.modsChanged(mods);
+
+    // In Neovim GUI mode, send mouse button events to Neovim via nvim_input_mouse API
+    if (self.nvim_gui) |nvim| {
+        // Check if mouse is enabled in Neovim
+        if (!nvim.mouse_enabled) return false;
+
+        // Convert Ghostty button to Neovim button string
+        const nvim_button = neovim_gui.nvim_input.toNeovimMouseButton(button) orelse return false;
+
+        // Get cursor position
+        const pos = try self.rt_surface.getCursorPos();
+
+        // Track multi-clicks for double/triple click support (left button only)
+        var click_count: u8 = 1;
+        if (button == .left and action == .press) {
+            // If we move our cursor too much between clicks then we reset
+            // the multi-click state.
+            if (self.mouse.left_click_count > 0) {
+                const max_distance: f64 = @floatFromInt(self.size.cell.width);
+                const distance = @sqrt(
+                    std.math.pow(f64, pos.x - self.mouse.left_click_xpos, 2) +
+                        std.math.pow(f64, pos.y - self.mouse.left_click_ypos, 2),
+                );
+                if (distance > max_distance) self.mouse.left_click_count = 0;
+            }
+
+            // Setup our click counter and timer
+            if (std.time.Instant.now()) |now| {
+                if (self.mouse.left_click_count > 0) {
+                    const since = now.since(self.mouse.left_click_time);
+                    if (since > self.config.mouse_interval) {
+                        self.mouse.left_click_count = 0;
+                    }
+                }
+                self.mouse.left_click_time = now;
+                self.mouse.left_click_count += 1;
+                if (self.mouse.left_click_count > 3) self.mouse.left_click_count = 1;
+            } else |_| {
+                self.mouse.left_click_count = 1;
+            }
+
+            // Store click position for tracking distance
+            self.mouse.left_click_xpos = pos.x;
+            self.mouse.left_click_ypos = pos.y;
+
+            click_count = self.mouse.left_click_count;
+        }
+
+        // Convert action to Neovim action string
+        const nvim_action = switch (action) {
+            .press => neovim_gui.nvim_input.toNeovimMouseAction(true, click_count),
+            .release => neovim_gui.nvim_input.toNeovimMouseAction(false, 0),
+        };
+
+        // Convert modifiers to Neovim modifier string
+        const nvim_mods = neovim_gui.nvim_input.toNeovimMouseMods(mods);
+
+        // Convert position to grid coordinates
+        const cell_w: f64 = @floatFromInt(self.size.cell.width);
+        const cell_h: f64 = @floatFromInt(self.size.cell.height);
+        const screen_col: f32 = @floatCast(@max(0, pos.x) / cell_w);
+        const screen_row: f32 = @floatCast(@max(0, pos.y) / cell_h);
+
+        // Find the window under the cursor and get grid-local coordinates
+        if (nvim.findWindowAtPosition(screen_col, screen_row)) |window_info| {
+            try nvim.sendMouse(
+                nvim_button,
+                nvim_action,
+                nvim_mods,
+                window_info.grid_id,
+                window_info.row,
+                window_info.col,
+            );
+        } else {
+            // No window found, send to grid 0 with screen coordinates
+            try nvim.sendMouse(
+                nvim_button,
+                nvim_action,
+                nvim_mods,
+                0,
+                @intFromFloat(screen_row),
+                @intFromFloat(screen_col),
+            );
+        }
+
+        try self.queueRender();
+        return true;
+    }
 
     // This is set to true if the terminal is allowed to capture the shift
     // modifier. Note we can do this more efficiently probably with less
@@ -4693,6 +5123,36 @@ pub fn cursorPosCallback(
 
         // If we're doing mouse motion tracking, we do not support text
         // selection.
+        return;
+    }
+
+    // In Neovim GUI mode, forward mouse motion/drag to Neovim and skip terminal selection.
+    // Without this, drag events fall into terminal selection code that dereferences
+    // left_click_pin which is never set in Neovim GUI mode, causing a crash.
+    if (self.nvim_gui) |nvim| {
+        if (nvim.mouse_enabled) {
+            // Check if any button is pressed (drag) or just motion
+            const left_pressed = self.mouse.click_state[@intFromEnum(input.MouseButton.left)] == .press;
+            const right_pressed = self.mouse.click_state[@intFromEnum(input.MouseButton.right)] == .press;
+            const middle_pressed = self.mouse.click_state[@intFromEnum(input.MouseButton.middle)] == .press;
+
+            if (left_pressed or right_pressed or middle_pressed) {
+                const nvim_button: []const u8 = if (left_pressed) "left" else if (right_pressed) "right" else "middle";
+                const nvim_mods = neovim_gui.nvim_input.toNeovimMouseMods(self.mouse.mods);
+
+                const cell_w: f64 = @floatFromInt(self.size.cell.width);
+                const cell_h: f64 = @floatFromInt(self.size.cell.height);
+                const screen_col: f32 = @floatCast(@max(0, pos.x) / cell_w);
+                const screen_row: f32 = @floatCast(@max(0, pos.y) / cell_h);
+
+                if (nvim.findWindowAtPosition(screen_col, screen_row)) |window_info| {
+                    try nvim.sendMouse(nvim_button, "drag", nvim_mods, window_info.grid_id, window_info.row, window_info.col);
+                } else {
+                    try nvim.sendMouse(nvim_button, "drag", nvim_mods, 0, @intFromFloat(screen_row), @intFromFloat(screen_col));
+                }
+                try self.queueRender();
+            }
+        }
         return;
     }
 

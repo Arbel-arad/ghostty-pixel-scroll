@@ -52,7 +52,8 @@ saved_cursor: ?SavedCursor = null,
 /// otherwise the selection will become invalid. Instead of accessing this
 /// directly to set it, use the `select` function which will assert and
 /// automatically setup tracking.
-selection: ?Selection = null,
+scroll_tracker: isize = 0,
+    selection: ?Selection = null,
 
 /// The charset state
 charset: CharsetState = .{},
